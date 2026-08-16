@@ -1,0 +1,115 @@
+# =============================================================================
+#  SIRLAR — buradaki her satir gercek bir sizinti riskini kapatiyor
+# =============================================================================
+# Bu blok en ustte cunku digerleri kozmetik, bu degil. Bir kez commit'lenen
+# sir, dosyayi sonradan silsen bile GECMISTE KALIR; tek gercek cozum anahtari
+# iptal edip yenisini uretmektir.
+
+# Gmail uygulama sifresi, Postgres parolasi, INTERNAL_API_KEY buradan geliyor.
+# `.env.example` ISTISNA: yer tutucu degerler icerir ve paylasilmasi GEREKIR —
+# yeni bir gelistirici hangi degiskenlerin gerektigini oradan ogreniyor.
+.env
+*.env
+!.env.example
+!*.env.example
+
+# JWT imzalama anahtarlari. `jwt_private.pem` sizarsa saldirgan istedigi
+# kullanici adina gecerli token URETEBILIR — parola bilmesine gerek kalmaz.
+# Public key de burada: ayri tutmanin faydasi yok, ikisi de uretilebilir
+# (services/infra/generate-keys.sh).
+services/infra/keys/
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+
+# Sertifikalar ve kimlik dosyalari
+*.crt
+*.cer
+credentials.json
+service-account*.json
+
+# =============================================================================
+#  Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Sanal ortamlar — bagimliliklar pyproject.toml'da tanimli, kurulum
+# makineye ozel.
+.venv/
+venv/
+env/
+ENV/
+
+# Arac onbellekleri. `.mypy_cache` tek basina 26 MB; hicbiri paylasilmaz.
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# =============================================================================
+#  IDE — makineye ozel, paylasilmasi ZARARLI
+# =============================================================================
+# .iml dosyalari yerel Python SDK'sina ADIYLA bagli
+# (<orderEntry jdkName="education">). Baska bir makinede o SDK yok ve dosya
+# ise yaramiyor; ustelik workspace.xml son acilan dosyalari ve mutlak yollari
+# tutuyor.
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# =============================================================================
+#  Claude Code
+# =============================================================================
+# `.claude/` COMMIT EDILIYOR — CLAUDE.md, agent tanimlari ve skill'ler projenin
+# tek dogruluk kaynagi (CLAUDE.md §1.5). Yalnizca yerel izin dosyasi haric:
+# icinde bu makineye ozel mutlak yollar var.
+.claude/settings.local.json
+
+# =============================================================================
+#  Isletim sistemi
+# =============================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =============================================================================
+#  Calisma zamani ciktilari
+# =============================================================================
+*.log
+logs/
+tmp/
+temp/
+
+# Postgres verisi Docker volume'unda (docker-compose.yml), depoda degil.
+# Yine de birinin `docker run -v ./pgdata:...` ile yerel klasore baglamasi
+# ihtimaline karsi:
+pgdata/
+postgres-data/
+
+# =============================================================================
+#  Veri seti ve ML artifact'leri (Phase 6-8)
+# =============================================================================
+# Videolar ve ham landmark kayitlari depoya girmez: hem buyuk hem KISISEL VERI
+# (ADR 0002 goruntunun cihazdan cikmamasini soyluyor; ayni mantik depoya da
+# girmemesini gerektiriyor).
+*.mp4
+*.mov
+*.avi
+data/raw/
+data/videos/
+*.tflite
+*.onnx
+*.pt
+*.pth
+*.h5

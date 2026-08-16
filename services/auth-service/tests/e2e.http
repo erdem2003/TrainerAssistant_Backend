@@ -1,0 +1,226 @@
+### auth-service — uçtan uca senaryo
+###
+### Kullanım: VS Code REST Client / JetBrains HTTP Client ile satır satır çalıştır.
+### Mailpit gelen kutusu: http://localhost:8025
+###
+### Bu dosya aynı zamanda servisin DAVRANIŞ SÖZLEŞMESİDİR: her adımın yanında
+### beklenen yanıt ve nedeni yazıyor.
+
+@host = http://localhost:8001
+@email = test@example.com
+@password = cok-guvenli-parola
+
+
+### 1 — Kayıt. Her durumda 202 döner.
+# Yanıt, e-postanın kayıtlı olup olmadığı hakkında BİLGİ TAŞIMAZ.
+POST {{host}}/v1/auth/registrations
+Content-Type: application/json
+
+{"email": "{{email}}", "password": "{{password}}"}
+
+
+### 2 — Mailpit'te kodu oku: http://localhost:8025
+# Kodu aşağıdaki değişkene yaz.
+@code = 000000
+
+
+### 3 — Yanlış kod (1. deneme) → 400 CODE_INVALID
+POST {{host}}/v1/auth/registrations/verify
+Content-Type: application/json
+
+{"email": "{{email}}", "code": "999999"}
+
+
+### 4 — Yanlış kod (2. deneme) → 400 CODE_INVALID
+POST {{host}}/v1/auth/registrations/verify
+Content-Type: application/json
+
+{"email": "{{email}}", "code": "999998"}
+
+
+### 5 — Yanlış kod (3. deneme) → 400 CODE_INVALIDATED
+# KRİTİK: bu noktada YENİ MAIL GELMEMELİ.
+# Otomatik göndermek, saldırganın kurbanın gelen kutusunu bombalamasına
+# izin verirdi: yanlış kod gir → yeni mail → tekrarla.
+POST {{host}}/v1/auth/registrations/verify
+Content-Type: application/json
+
+{"email": "{{email}}", "code": "999997"}
+
+
+### 6 — Kullanıcı yeni kod ister → 202, Mailpit'te yeni kod
+POST {{host}}/v1/auth/registrations/resend
+Content-Type: application/json
+
+{"email": "{{email}}"}
+
+
+### 7 — Hemen tekrar iste → 429, Retry-After başlığı ile
+# 60 saniye bekleme kuralı. Redis düşse bile veritabanındaki son üretim
+# zamanından kontrol ediliyor.
+POST {{host}}/v1/auth/registrations/resend
+Content-Type: application/json
+
+{"email": "{{email}}"}
+
+
+### 8 — Doğru kod → 200 + token çifti, hesap ACTIVE
+POST {{host}}/v1/auth/registrations/verify
+Content-Type: application/json
+
+{"email": "{{email}}", "code": "{{code}}"}
+
+
+### 9 — Giriş → 200 + token çifti
+POST {{host}}/v1/auth/sessions
+Content-Type: application/json
+
+{"email": "{{email}}", "password": "{{password}}", "device_label": "Test cihazı"}
+
+@refresh = BURAYA_YANITTAKI_refresh_token
+
+
+### 10 — Yenileme → 200 + YENİ çift
+POST {{host}}/v1/auth/sessions/refresh
+Content-Type: application/json
+
+{"refresh_token": "{{refresh}}"}
+
+
+### 11 — ★ KRİTİK TEST ★ Eski refresh token'ı TEKRAR gönder → 401
+# Rotasyonun tek amacı budur. Zaten kullanılmış bir token'ın tekrar sunulması
+# ya replay ya hırsızlıktır; ailenin TAMAMI iptal edilir.
+# Bundan sonra 10. adımda alınan YENİ token da çalışmamalı.
+POST {{host}}/v1/auth/sessions/refresh
+Content-Type: application/json
+
+{"refresh_token": "{{refresh}}"}
+
+
+### 12 — Bilinmeyen e-posta ile giriş → 401 INVALID_CREDENTIALS
+# Yanlış parola ile AYNI hata ve BENZER SÜRE dönmeli.
+POST {{host}}/v1/auth/sessions
+Content-Type: application/json
+
+{"email": "boyle-bir-hesap-yok@example.com", "password": "herhangi"}
+
+
+### 13 — Doğrulanmış hesaba tekrar kayıt → yine 202
+# Hesap DEĞİŞMEZ; adresin sahibine "biri kayıt olmaya çalıştı" maili gider.
+# Yanıt 1. adımdakiyle birebir aynı.
+POST {{host}}/v1/auth/registrations
+Content-Type: application/json
+
+{"email": "{{email}}", "password": "baska-bir-parola"}
+
+
+### 14 — Eski parolayla giriş hâlâ çalışmalı
+# 13. adım hesabı değiştirmediyse bu 200 döner.
+POST {{host}}/v1/auth/sessions
+Content-Type: application/json
+
+{"email": "{{email}}", "password": "{{password}}"}
+
+
+### 15 — Sağlık
+GET {{host}}/health/ready
+
+
+### ==========================================================================
+### PAROLA SIFIRLAMA
+### ==========================================================================
+
+### 16 — Sıfırlama kodu iste → 202 (her zaman)
+# Olmayan bir e-posta için de aynı yanıt döner: enumeration koruması.
+POST {{host}}/v1/auth/password-resets
+Content-Type: application/json
+
+{"email": "{{email}}"}
+
+
+### 17 — Yanlış kod × 3 → 3. denemede CODE_INVALIDATED
+POST {{host}}/v1/auth/password-resets/confirm
+Content-Type: application/json
+
+{"email": "{{email}}", "code": "000000", "new_password": "yeni-parola-123"}
+
+
+### 18 — Doğru kod → 200 + YENİ token çifti (otomatik giriş)
+# Kullanıcı iki şeyi kanıtladı: e-posta kutusuna erişim ve yeni parolayı bilmek.
+# Tekrar giriş ekranına yollamak gereksiz sürtünme olurdu.
+@resetcode = 000000
+POST {{host}}/v1/auth/password-resets/confirm
+Content-Type: application/json
+
+{"email": "{{email}}", "code": "{{resetcode}}", "new_password": "yeni-parola-123"}
+
+
+### 19 — ★ KRİTİK ★ Sıfırlamadan ÖNCE alınmış refresh token → 401
+# Parola sıfırlanıyorsa muhtemel sebep hesabın ele geçirilmesi.
+# Saldırganın elindeki token'ları ayakta bırakmak sıfırlamayı anlamsız kılardı.
+POST {{host}}/v1/auth/sessions/refresh
+Content-Type: application/json
+
+{"refresh_token": "{{refresh}}"}
+
+
+### ==========================================================================
+### PAROLA DEĞİŞTİRME (oturum açıkken)
+### ==========================================================================
+
+@access = BURAYA_ACCESS_TOKEN
+
+### 20 — Tokensiz → 401
+PUT {{host}}/v1/auth/password
+Content-Type: application/json
+
+{"current_password": "yeni-parola-123", "new_password": "ucuncu-parola-456"}
+
+
+### 21 — Mevcut parola yanlış → 401 INVALID_CREDENTIALS
+# Geçerli access token TEK BAŞINA yeterli değil: çalınmış bir token'la parolanın
+# değiştirilebilmesi, hesabın tamamen ele geçirilmesi demek olurdu.
+PUT {{host}}/v1/auth/password
+Content-Type: application/json
+Authorization: Bearer {{access}}
+
+{"current_password": "tamamen-yanlis", "new_password": "ucuncu-parola-456"}
+
+
+### 22 — Doğru → 200 + yeni çift, diğer tüm oturumlar kapanır
+PUT {{host}}/v1/auth/password
+Content-Type: application/json
+Authorization: Bearer {{access}}
+
+{"current_password": "yeni-parola-123", "new_password": "ucuncu-parola-456"}
+
+
+### ==========================================================================
+### HESAP SİLME
+### ==========================================================================
+
+### 23 — Parola yanlış → 401
+# Geri dönüşü olmayan bir işlem için token yetmez.
+DELETE {{host}}/v1/auth/account
+Content-Type: application/json
+Authorization: Bearer {{access}}
+
+{"password": "yanlis"}
+
+
+### 24 — Doğru → 204
+# users satırı silinir; verification_codes ve refresh_tokens CASCADE ile gider.
+# `AccountDeleted` event'i outbox'a düşer — Phase 11'de workout ve analytics
+# bunu dinleyip kendi verilerini temizleyecek (auth başkasının DB'sine dokunamaz).
+DELETE {{host}}/v1/auth/account
+Content-Type: application/json
+Authorization: Bearer {{access}}
+
+{"password": "ucuncu-parola-456"}
+
+
+### 25 — Silinen hesapla giriş → 401
+POST {{host}}/v1/auth/sessions
+Content-Type: application/json
+
+{"email": "{{email}}", "password": "ucuncu-parola-456"}

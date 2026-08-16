@@ -1,0 +1,31 @@
+[project]
+name = "auth-service"
+version = "1.0.0"
+description = "AI Fitness Coach - kimlik dogrulama servisi"
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    # asyncpg: ORM yok, ham SQL. Sorgular gozden gecirilebilir olsun diye.
+    "asyncpg>=0.30",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "email-validator>=2.2",
+    "bcrypt>=4.2",
+    # RS256 icin cryptography gerekli.
+    "pyjwt[crypto]>=2.10",
+    "redis>=5.2",
+    # E-posta: smtplib STANDART KUTUPHANE, ek bagimlilik yok.
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

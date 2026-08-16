@@ -1,0 +1,178 @@
+# Yerel geliştirme ortamı — tek komutla ayağa kalkar.
+#
+#   cp .env.example .env
+#   ./infra/generate-keys.sh
+#   docker compose up --build
+#
+# ADR 0005'in pratik sonucu: her servisin KENDİ veritabanı var. Tek Postgres
+# örneği çalışıyor ama içinde ayrı veritabanları açılıyor ve her servis yalnızca
+# kendisininkine bağlanıyor. Üretimde ayrı örneklere bölmek yalnızca bağlantı
+# dizesi değiştirmek demek — sınır kod tarafında zaten var.
+
+name: trainer-asistant
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trainer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trainer}
+      POSTGRES_DB: postgres
+    ports:
+      # 5433 bilinçli: geliştiricinin makinesinde zaten bir Postgres olabilir ve
+      # 5432 çakışması ilk denemede anlaşılması zor bir hata üretir.
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/init-databases.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      # Servisler Postgres hazır olmadan başlarsa ilk migration çöker.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trainer} -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  auth-service:
+    build:
+      context: ./auth-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/auth_db
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: auth-service
+      JWT_PRIVATE_KEY_PATH: /run/keys/jwt_private.pem
+      JWT_PUBLIC_KEY_PATH: /run/keys/jwt_public.pem
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+
+      # --- Hiz sinirlari: GELISTIRME icin gevsetildi ---
+      #
+      # `app/config.py`'deki VARSAYILANLAR DEGISMEDI ve uretim degerleri
+      # onlar (kayit 3/saat, giris 5/dk). Gevsetme yalnizca burada, compose
+      # dosyasinda; uretime cikarken bu blok SILINIR ve kod varsayilanlari
+      # geri gelir.
+      #
+      # Neden kodu degistirmedim: bu sayilar kaba kuvvet savunmasi. Kodun
+      # icinde gevsetilseydi "gelistirme icin" notu zamanla unutulur ve
+      # uretime gevsek deger giderdi.
+      LOGIN_PER_EMAIL_PER_MINUTE: ${LOGIN_PER_EMAIL_PER_MINUTE:-30}
+      LOGIN_PER_IP_PER_MINUTE: ${LOGIN_PER_IP_PER_MINUTE:-120}
+      REGISTER_PER_EMAIL_PER_HOUR: ${REGISTER_PER_EMAIL_PER_HOUR:-50}
+      REGISTER_PER_IP_PER_HOUR: ${REGISTER_PER_IP_PER_HOUR:-200}
+      # Gmail'in gunluk gonderim sinirini (kisisel hesapta ~500) zorlamamak
+      # icin tamamen kaldirilmadi, 60 sn'den 10 sn'ye indirildi.
+      RESEND_COOLDOWN_SECONDS: ${RESEND_COOLDOWN_SECONDS:-10}
+      RESEND_PER_EMAIL_PER_HOUR: ${RESEND_PER_EMAIL_PER_HOUR:-50}
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      # Geliştirmede canlı yeniden yükleme: imajı yeniden derlemeden kod değişir.
+      - ./auth-service/app:/srv/app:ro
+      - ./auth-service/migrations:/srv/migrations:ro
+      # Anahtarlar salt okunur bağlanıyor ve imaja GÖMÜLMÜYOR — imaj paylaşılsa
+      # bile private key sızmaz.
+      - ./infra/keys:/run/keys:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # user-service — kullanici profili (ADR 0005: olculer, kalibrasyon, tercihler).
+  #
+  # KENDI VERITABANI VAR (`user_db`) ve auth_db'ye ERISIMI YOK. Baglanti dizesi
+  # tek basina bu siniri kuruyor: yanlislikla baska bir tabloya sorgu atmak
+  # mumkun degil, cunku o tablo bu baglantidan gorunmuyor.
+  #
+  # Redis YOK: hiz siniri gateway'de, bu servis oturum/sayac tutmuyor.
+  user-service:
+    build:
+      context: ./user-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/user_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: user-service
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+    ports:
+      # Gelistirmede gateway'i atlayarak dogrudan test edebilmek icin.
+      # Uretimde bu yayin KALDIRILIR — tek dis kapi gateway olmali.
+      - "8002:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./user-service/app:/srv/app:ro
+      - ./user-service/migrations:/srv/migrations:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # E-posta worker'ı — auth-service'in İKİNCİ SÜRECİ, ayrı servis değil.
+  # Aynı imaj, aynı veritabanı, farklı entrypoint. ADR 0005 ayrı bir Notification
+  # servisi kurulmayacağını söylüyor; bu onunla uyumlu.
+  auth-email-worker:
+    build:
+      context: ./auth-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/auth_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: auth-email-worker
+      # SMTP ayarlari .env'den. Varsayilan Mailpit (yerel), gercek gonderim icin
+      # .env'de smtp.gmail.com + uygulama sifresi verilir.
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-AI Fitness Coach <no-reply@trainerasistant.local>}
+      # Hesap silindiğinde user-service'e haber vermek için (bkz. worker/fanout.py).
+      USER_SERVICE_URL: http://user-service:8000
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-service:
+        # Şemayı auth-service'in migration'ı kuruyor; worker ondan sonra başlamalı.
+        condition: service_started
+      user-service:
+        # Silme bildirimi buraya gidiyor. Ayakta olmaması ölümcül DEĞİL —
+        # outbox satırı yeniden denenir — ama gereksiz hata log'u üretmesin.
+        condition: service_started
+    volumes:
+      - ./auth-service/app:/srv/app:ro
+    command: python -m app.worker.outbox_worker
+
+  # api-gateway — nginx.
+  #
+  # Tek dis kapi. Yonlendirme, correlation ID, kaba hiz siniri ve —en onemlisi—
+  # X-User-Id basliginin ISTEMCIDEN gelmesini engelleme.
+  #
+  # Arka servisler kimligi o baslikdan okuyup KENDILERI dogrulamiyor
+  # (service-contract §2); istemci onu gonderebilseydi herkes istedigi kullanici
+  # olabilirdi. Gateway basligi her istekte siliyor.
+  api-gateway:
+    build:
+      context: ./api-gateway
+    ports:
+      - "8080:80"
+    depends_on:
+      auth-service:
+        condition: service_started
+      user-service:
+        condition: service_started
+    volumes:
+      # Gelistirmede yapilandirma degisikligi icin imaji yeniden derlemeye gerek yok:
+      #   docker compose exec api-gateway nginx -s reload
+      - ./api-gateway/conf.d:/etc/nginx/conf.d:ro
+
+volumes:
+  postgres-data:
