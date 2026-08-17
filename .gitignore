@@ -158,3 +158,5 @@ recordings/
 dataset/
 dataset_*/
 *.parquet
+
+.claude
