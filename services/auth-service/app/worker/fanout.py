@@ -16,9 +16,13 @@ class FanoutFailed(Exception):
     """Karşı servis ulaşılamadı ya da hata döndü — outbox satırı tekrar denenmeli."""
 
 
-def _delete_user_data(event_id: str, user_id: str) -> None:
-    """`user-service`'e profil silme çağrısı."""
-    url = f"{settings.user_service_url}/internal/users/{user_id}"
+def _delete_user_data(service: str, base_url: str, event_id: str, user_id: str) -> None:
+    """Bir servise kullanıcı verisi silme çağrısı.
+
+    `X-Event-Id` tekrar koruma anahtarı olarak gidiyor: aynı olay yeniden
+    teslim edilirse karşı taraf işi atlar ama yine başarı döner.
+    """
+    url = f"{base_url}/internal/users/{user_id}"
     request = urllib.request.Request(url, method="DELETE")
     request.add_header("X-Internal-Key", settings.internal_api_key)
     request.add_header("X-Event-Id", event_id)
@@ -26,11 +30,11 @@ def _delete_user_data(event_id: str, user_id: str) -> None:
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             if response.status not in (200, 204):
-                raise FanoutFailed(f"user-service {response.status} döndü")
+                raise FanoutFailed(f"{service} {response.status} döndü")
     except urllib.error.HTTPError as exc:
-        raise FanoutFailed(f"user-service {exc.code} döndü") from exc
+        raise FanoutFailed(f"{service} {exc.code} döndü") from exc
     except urllib.error.URLError as exc:
-        raise FanoutFailed(f"user-service'e ulaşılamadı: {exc.reason}") from exc
+        raise FanoutFailed(f"{service}'e ulaşılamadı: {exc.reason}") from exc
 
 
 def dispatch(event_id: str, event_type: str, payload: dict) -> None:
@@ -44,5 +48,18 @@ def dispatch(event_id: str, event_type: str, payload: dict) -> None:
         logger.error("AccountDeleted payload'ında user_id yok event_id=%s", event_id)
         return
 
-    _delete_user_data(event_id, user_id)
-    logger.info("user-service'e silme bildirildi user_id=%s", user_id)
+    # SIRA ÖNEMSİZ ama HEPSİ BAŞARILI OLMALI: biri patlarsa istisna yayılır,
+    # outbox satırı yeniden denenir ve tümü tekrar çağrılır. Tekrar zararsız,
+    # çünkü hepsi `processed_events` ile tekrara dayanıklı.
+    #
+    # Yeni bir servis kullanıcı verisi tutmaya başladığında bu listeye eklenir.
+    # Phase 11'de liste kalkacak; herkes Kafka'dan `AccountDeleted` dinleyecek.
+    targets = [
+        ("user-service", settings.user_service_url),
+        ("workout-service", settings.workout_service_url),
+        ("health-service", settings.health_service_url),
+    ]
+
+    for service, base_url in targets:
+        _delete_user_data(service, base_url, event_id, user_id)
+        logger.info("%s'e silme bildirildi user_id=%s", service, user_id)

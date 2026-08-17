@@ -31,6 +31,21 @@ credentials.json
 service-account*.json
 
 # =============================================================================
+#  TESTLER — sahibin karari (2026-08-17)
+# =============================================================================
+# ★ BU BILINCLI BIR TERCIH VE BEDELI VAR ★
+# Test KODU depoya girmiyor. Bedeli: depoyu klonlayan biri (juri dahil) 73 backend
+# entegrasyon testini goremiyor ve CI kurulamaz — testler kod tabaninin en guclu
+# kalite sinyaliydi. Sahip bu bedeli bilerek kabul etti; geri almak icin asagidaki
+# blogu silmek yeterli.
+#
+# NOT: `.gitignore` yalnizca IZLENMEYEN dosyayi gizler. Zaten commit'lenmis test
+# dosyalari icin ayrica `git rm --cached <yol>` gerekiyor.
+services/*/tests/
+services/conftest.py
+services/pytest.ini
+
+# =============================================================================
 #  Python
 # =============================================================================
 __pycache__/
@@ -69,12 +84,29 @@ build/
 *.swo
 
 # =============================================================================
-#  Claude Code
+#  Claude Code — sahibin karari (2026-08-17)
 # =============================================================================
-# `.claude/` COMMIT EDILIYOR — CLAUDE.md, agent tanimlari ve skill'ler projenin
-# tek dogruluk kaynagi (CLAUDE.md §1.5). Yalnizca yerel izin dosyasi haric:
-# icinde bu makineye ozel mutlak yollar var.
-.claude/settings.local.json
+# Onceden `.claude/` COMMIT EDILIYORDU (CLAUDE.md §1.5 onu tek dogruluk kaynagi
+# ilan ediyor). Sahip depoda gorunmesini istemedi.
+#
+# Bedeli: `pose-math/references/test-vectors.md` ve `exercise-spec/` sablonu da
+# gidiyor — bunlar surec dokumani DEGIL, Kotlin ile Python'un ayni sonucu
+# vermesini taniml ayan MUHENDISLIK SOZLESMELERIYDI. Yerelde duruyorlar ama
+# depoyu klonlayan kimsede olmuyorlar.
+.claude/
+
+# =============================================================================
+#  Dokumanlar — sahibin karari (2026-08-17)
+# =============================================================================
+# 12 ADR, 3 egzersiz spec'i, feature tanimlari ve yol haritasi depoya girmiyor.
+# Yerelde duruyorlar. Geri almak icin bu iki satiri silmek yeterli.
+docs/
+
+# Butun markdown dosyalari — README'ler HARIC.
+# README kaliyor cunku depoyu acan kisinin projenin ne oldugunu ve nasil
+# calistirilacagini gorebilecegi tek yer o.
+*.md
+!README.md
 
 # =============================================================================
 #  Isletim sistemi
@@ -113,3 +145,16 @@ data/videos/
 *.pt
 *.pth
 *.h5
+
+# Pose kayitlari — kullanicinin KENDI vucut hareketinin izi. Anonim gorunuyor
+# ama bir kisinin boy oranlarini ve hareket imzasini tasiyor.
+*.poserec
+poserec/
+poserec_*/
+recordings/
+
+# Uretilen dataset dosyalari. Kaynagi (kayitlar + uretim betigi) yeterli;
+# ciktinin kendisi buyuk ve yeniden uretilebilir.
+dataset/
+dataset_*/
+*.parquet

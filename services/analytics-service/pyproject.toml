@@ -1,0 +1,27 @@
+[project]
+name = "analytics-service"
+version = "1.0.0"
+description = "AI Fitness Coach - olay akisindan turetilen okuma modeli (ADR 0006)"
+requires-python = ">=3.12"
+
+# `aiokafka` BURADA ZORUNLU: bu servisin varlik sebebi olay tuketmek.
+# Diger servislerde opsiyonel bir eklentiyken burada cekirdek bagimlilik.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "asyncpg>=0.30",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "aiokafka>=0.11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

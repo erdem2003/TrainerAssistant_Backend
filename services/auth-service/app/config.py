@@ -78,6 +78,8 @@ class Settings(BaseSettings):
     # Hesap silindiğinde user-service'e haber vermek için. Ayrıntılı gerekçe:
     # app/worker/fanout.py
     user_service_url: str = "http://user-service:8000"
+    workout_service_url: str = "http://workout-service:8000"
+    health_service_url: str = "http://health-service:8000"
     internal_api_key: str = ""
 
     # Worker'ın outbox'ı tarama sıklığı. Kısa tutuluyor: kullanıcı kayıt olduktan

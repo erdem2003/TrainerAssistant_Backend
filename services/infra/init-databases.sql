@@ -7,3 +7,5 @@ CREATE DATABASE auth_db;
 CREATE DATABASE user_db;
 CREATE DATABASE workout_db;
 CREATE DATABASE analytics_db;
+-- ADR 0010: gunluk saglik kaydi (su, ileride uyku ve kilo gecmisi).
+CREATE DATABASE health_db;

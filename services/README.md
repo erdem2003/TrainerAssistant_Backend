@@ -1,18 +1,28 @@
 # services — Backend
 
-Phase 10. ADR 0005 uyarınca **database-per-service**; hiçbir servis başkasının
-veritabanına dokunmaz.
+ADR 0005 uyarınca **database-per-service**; hiçbir servis başkasının veritabanına
+dokunmaz. ADR 0006 uyarınca servisler arası asenkron akış **Kafka + outbox**.
 
-| Servis | Durum | Port | Veritabanı |
+| Servis | Port | Veritabanı | Ne yapıyor |
 |---|---|---|---|
-| `api-gateway` (nginx) | ✅ çalışıyor | **8080** | — |
-| `auth-service` | ✅ çalışıyor | 8001 | `auth_db` |
-| `user-service` | ⬜ | 8002 | `user_db` |
-| `workout-service` | ⬜ | 8003 | `workout_db` |
-| `analytics-service` | ⬜ | 8004 | `analytics_db` |
+| `api-gateway` (nginx) | **8080** | — | Tek dış kapı; kimlik doğrular, `X-User-Id` yazar |
+| `auth-service` | 8001 | `auth_db` | Kayıt, doğrulama kodu, token rotasyonu, hesap silme |
+| `user-service` | 8002 | `user_db` | Profil (kilo, boy, yaş, günlük hedef) |
+| `workout-service` | 8003 | `workout_db` | Antrenman kaydı, günlük program, istatistik, egzersiz kataloğu |
+| `health-service` | 8004 | `health_db` | Su ve uyku takibi (ADR 0010) |
+| `analytics-service` | 8005 | `analytics_db` | Kafka'dan beslenen antrenman projeksiyonu |
 
-Sözleşme kuralları (URL, hata biçimi, idempotency, sayfalama, event şeması):
-`.claude/skills/service-contract/SKILL.md`
+Ayrıca üç arka plan işçisi (ayrı konteyner, aynı imaj):
+
+| İşçi | Ne yapıyor |
+|---|---|
+| `workout-outbox-relay` | `outbox` tablosundan Kafka'ya yayınlar |
+| `analytics-consumer` | `workout.session` konusunu tüketip `workout_facts`'e yazar |
+| `auth-email-worker` | Doğrulama kodu e-postalarını gönderir |
+
+Sözleşme kuralları (URL, hata biçimi, idempotency, sayfalama, event şeması) ayrı bir
+belgede tutuluyor ve **bu depoda yok**; aşağıdaki bölümler o kuralların uygulamadaki
+karşılığını anlatıyor.
 
 ---
 
@@ -28,14 +38,31 @@ docker compose up --build
 | Ne | Nerede |
 |---|---|
 | **api-gateway (tek dış kapı)** | http://localhost:8080 |
-| auth-service (doğrudan, geliştirme) | http://localhost:8001 |
-| API dokümanı | http://localhost:8001/docs |
-| **Mailpit gelen kutusu** | http://localhost:8025 |
-| Postgres | `localhost:5433` (kullanıcı/parola: `trainer`) |
+| Servisler (doğrudan, geliştirme) | 8001–8005 |
+| API dokümanı | `http://localhost:<port>/docs` |
+| Postgres | `localhost:5433` |
 | Redis | `localhost:6380` |
+| Redpanda (Kafka API) | `localhost:19092` |
 
-**Gerçek e-posta gönderilmez.** Yerel geliştirmede Mailpit tüm mailleri yakalar;
-doğrulama kodları tarayıcıdan okunur.
+**Portlar yalnızca geliştirme için dışarı açık.** Üretimde tek giriş gateway olur;
+`docker-compose.yml`'deki `ports:` blokları kaldırılır. Testler bu yayınlara
+dayanıyor (aşağıda).
+
+**E-posta gerçekten gönderiliyor.** `.env` içindeki `SMTP_*` değerleri Gmail'e
+bağlanıyor; `SMTP_PASSWORD` bir uygulama şifresi ve **depoya girmez**.
+
+### Sağlık kontrolü
+
+```bash
+curl localhost:8080/health/live                  # gateway ayakta mı
+for p in 8001 8002 8003 8004 8005; do
+  curl -s -o /dev/null -w "$p -> %{http_code}\n" localhost:$p/health/ready
+done
+```
+
+`/health/live` bağımlılık kontrol etmez (süreç ayakta mı), `/health/ready`
+veritabanını yoklar. Ayrım bilinçli: yeniden başlatma kararı ile trafik alma
+kararı aynı şey değil.
 
 ---
 
@@ -227,31 +254,166 @@ tamamen durdurmak, hız sınırı kaybetmekten kötü bir arıza. Kritik kuralla
 
 ---
 
-## Test
+## workout-service
 
-```bash
-# Birim testler
-docker compose run --rm --user root --no-deps \
-  -v "$PWD/auth-service/tests:/srv/tests:ro" auth-service \
-  sh -c "uv pip install --system --no-cache -q pytest pytest-asyncio && cd /srv && python -m pytest tests -q"
+En yüklü servis. Üç ayrı sorumluluk taşıyor ve hepsi aynı `workout_db`'de:
 
-# Uçtan uca senaryo
-# tests/e2e.http dosyasını REST Client ile satır satır çalıştır
+| Alan | Uçlar |
+|---|---|
+| Antrenman kaydı | `POST /v1/workouts`, `GET /v1/workouts`, `GET /v1/workouts/{id}` |
+| Günlük program | `GET|PUT /v1/plan`, `GET /v1/plan/range` |
+| İstatistik | `GET /v1/stats/daily` |
+
+### Idempotent yükleme
+
+Mobil taraf ağ hatasında yüklemeyi **tekrar deniyor**. Bu ancak sunucu aynı `id`'yi
+ikinci kez gördüğünde yeni kayıt açmazsa güvenli:
+
+- Aynı `id`, **aynı içerik** → `200` (çakışma değil; sonuç istenen durumla aynı)
+- Aynı `id`, **farklı içerik** → `409`
+
+`409` dönmek ilk durumda mobil senkron kuyruğunu kilitlerdi.
+
+### Tamamlanma saklanmaz, türetilir
+
+`plan_items` tablosunda "yapıldı" diye bir kolon **yok** (ADR 0012).
+Her istekte `reps` satırlarından sayılıyor. Saklansaydı kullanıcı hedefini 10'dan
+30'a çıkardığında eski "tamamlandı" işareti kalır ve yapmadığı bir programı
+yapılmış görürdü.
+
+### Gün sınırı saat dilimine göre
+
+`workouts.started_at` UTC; kullanıcı yerel günde yaşıyor. İstemci `tz_offset`
+(dakika) gönderiyor, sunucu **yarı açık UTC aralığına** çeviriyor `start, end)`.
+Çevrim yapılmasaydı İstanbul'da gece 01:00'de yapılan antrenman düne yazılırdı.
+
+İki tuzak koda yorum olarak yazılı:
+- `timestamptz::date` Postgres'in **oturum** saat dilimine bağlanır → önce
+  `AT TIME ZONE 'UTC'`
+- asyncpg `interval` parametresini `timedelta`'dan kodlar; `'180 minutes'` metni
+  parametre kodlamasında patlar
+
+### Kartezyen tuzağı
+
+`sets` ve `reps` tek JOIN'de toplansaydı her set süresi kendi tekrar sayısı kadar
+tekrarlanır ve `active_seconds` kat kat şişerdi — **hata mesajı olmadan**. Set ve
+tekrar granülariteleri ayrı CTE'lerde toplanıyor.
+
+---
+
+## health-service
+
+Su ve uyku ([ADR 0010). Basit CRUD
+ama iki ayrım önemli:
+
+**Su: ekle ≠ ayarla.** `POST` birikimli ("200 ml daha içtim" doğası gereği toplanır,
+aynı isteği iki kez göndermek 400 ml demek ve bu **doğru**). `PUT` doğrudan ayarlar
+ve idempotent — yanlış sayılan miktarı geri çekmenin yolu.
+
+**Uyku: `null` ≠ `0`.** Kayıt yoksa `minutes: null` döner, `0` değil. Sıfır "hiç
+uyumadım", null "girmedim" demek ve ortalama hesabında farklı davranmaları gerekiyor
+— `SleepInsights`'ın uyku–antrenman karşılaştırması bunun üstüne kurulu.
+
+---
+
+## analytics-service + olay akışı
+
+```
+workout-service                          analytics-service
+  ┌──────────────────────┐
+  │ TEK TRANSACTION      │
+  │  workouts   INSERT   │
+  │  outbox     INSERT   │
+  └──────────┬───────────┘
+             │  outbox-relay (yoklama)
+             ▼
+        Kafka  workout.session          ┌──────────────────┐
+             ├──────────────────────────▶ consumer         │
+             │  key = user_id           │  processed_events│
+             │  (sıra garantisi)        │  workout_facts   │
+             └──────────────────────────└──────────────────┘
 ```
 
-Doğrulanmış davranışlar:
+**Neden outbox.** Olay doğrudan Kafka'ya yazılsaydı commit ile publish arasında
+düşen bir süreç kalıcı veri kaybı bırakırdı. İkisi aynı transaction'da: kayıt varsa
+olay da var.
 
-- ✅ Kayıt → outbox → worker → Mailpit zinciri
-- ✅ E-posta normalize ediliyor (`Test@Example.COM` → `test@example.com`)
-- ✅ 3 yanlış denemede kod geçersiz, **yeni mail gönderilmiyor**
-- ✅ 60 saniye bekleme kuralı (`Retry-After` başlığıyla)
-- ✅ **Yeniden kullanım tespiti: aile iptal ediliyor**
-- ✅ Bilinmeyen e-posta ve yanlış parola aynı hata, benzer süre
-- ✅ Doğrulanmış hesaba kayıt denemesi hesabı değiştirmiyor
+**Neden idempotent consumer.** Kafka en az bir kez teslim ediyor. `processed_events`
+tablosu aynı `event_id`'yi ikinci kez işlemeyi engelliyor.
+
+**Neden `ON CONFLICT DO UPDATE`, `DO NOTHING` değil.** Replay sırasında satırlar
+zaten var; `DO NOTHING` olsaydı yeniden oynatma hiçbir şey değiştirmezdi. Replay'in
+anlamı tam olarak "aynı olaydan güncel mantıkla yeniden üret".
+
+**Neden `workout_facts` gün bazında toplanmıyor.** Yazma anında kullanıcının saat
+dilimi bilinmiyor; gün etiketi okuma anında `tz_offset` ile hesaplanıyor.
+
+### Replay
+
+```bash
+# Tüketici grubunu sil, REPLAY_MODE=true ile baştan oynat
+docker compose exec redpanda rpk group delete analytics-workout-v1
+REPLAY_MODE=true docker compose up analytics-consumer
+```
+
+`REPLAY_MODE` `processed_events` kontrolünü atlar — normal çalışmada tekrarı yutmak
+isteniyor, replay'de yeniden işlemek.
+
+### Akış sağlığı
+
+```bash
+# Tüketici gecikmesi 0 olmalı
+docker compose exec redpanda rpk group describe analytics-workout-v1
+
+# Yayınlanmamış / hatalı outbox satırı olmamalı
+docker compose exec postgres psql -U trainer -d workout_db -c \
+  "SELECT count(*) FILTER (WHERE published_at IS NULL) AS bekleyen,
+          count(*) FILTER (WHERE last_error IS NOT NULL) AS hatali FROM outbox;"
+```
+
+---
+
+## Test
+
+Testler **host'tan, çalışan yığına HTTP atarak** koşuyor:
+
+```bash
+cd services
+pytest
+```
+
+**Neden mock değil gerçek Postgres.** Bu servislerin değerinin çoğu SQL'de: gün
+sınırı hesabı, kartezyen tuzağı, `ON CONFLICT` davranışı, idempotency. Mock'lanan
+bir veritabanı tam da bu hataları **gizler**. Geliştirme sırasında elle bulunan üç
+hata da (asyncpg `interval` kodlaması, `timestamptz::date`'in oturum saat dilimine
+bağlanması, `SUM`'ın kartezyene düşmesi) ancak gerçek Postgres'te görünürdü.
+
+**Neden konteyner içinden değil.** İmajlar yalnızca çalışma bağımlılıklarını
+kuruyor; `pytest` `dev` extras'ta ve imajda yok.
+
+**Tablolar temizlenmiyor.** Bu veritabanlarında **gerçek kullanıcı verisi** var.
+`TRUNCATE` yerine her test rastgele bir `user_id` üretiyor; temizlik yalnızca o
+kullanıcının satırlarını siliyor. Silme sırası önemli — önce `outbox` (yayınlanmamış
+olay hiç gitmesin), sonra kaynak tablolar, en son `analytics_db` **yoldaki olaylar
+inene kadar yoklanarak**.
+
+Kapsanan davranışlar:
+
+| Servis | Ne doğrulanıyor |
+|---|---|
+| `workout` | Aynı id iki kez → tek kayıt; farklı içerik → 409; içerik özeti sıra bağımsız |
+| `workout` | Gece 01:00 antrenmanı bugüne düşüyor; aynı antrenman `tz_offset=0` ile düne |
+| `workout` | Hedef değişince tamamlanma kendiliğinden değişiyor; hedefin üstü kırpılmıyor |
+| `workout` | `active_seconds` kartezyene düşmüyor; dinlenme aktif süreye girmiyor |
+| `health` | Ekle ≠ ayarla; uyku `null` ≠ `0`; 20 L üst sınırında kırpma |
+| `analytics` | Uçtan uca Kafka akışı; tekrarlanan olay yeniden işlenmiyor; kayıt çoğaltmıyor |
+| `auth` | Token rotasyonu; **yeniden kullanımda ailenin tamamı düşüyor**; hız sınırı |
 
 ---
 
 ## Sırada
 
-`api-gateway` (JWT doğrulama + `X-User-Id` yazımı) → `user-service` →
-`workout-service` → `analytics-service`.
+- **Observability (Phase 12)** — OpenTelemetry, Prometheus, Kafka sınırını geçen trace
+- **`auth` fanout'unun Kafka'ya taşınması** — hesap silme hâlâ elle yazılmış listeden HTTP ile gidiyor
+- **`/v1/analytics/daily`'nin gateway'de yayınlanması** — günlük toplamları hâlâ `workout-service` veriyor; ikisini birden açmak aynı sayı için iki kaynak demekti
+- **Kubernetes + CI/CD (Phase 13)**

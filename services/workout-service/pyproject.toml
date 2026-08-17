@@ -1,0 +1,38 @@
+[project]
+name = "workout-service"
+version = "1.0.0"
+description = "AI Fitness Coach - antrenman servisi"
+requires-python = ">=3.12"
+
+# auth-service'e gore DAHA AZ bagimlilik var ve bu bilincli:
+#   - bcrypt / pyjwt YOK  : bu servis credential tutmuyor, token dogrulamiyor.
+#                           Kimlik dogrulamasi gateway'de yapiliyor
+#                           (service-contract §2), buraya X-User-Id olarak geliyor.
+#   - redis YOK           : hiz siniri gateway'de. Profil uclari kaba kuvvet
+#                           hedefi degil; Redis eklemek bakimi olan ama karsiligi
+#                           olmayan bir bagimlilik olurdu.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "asyncpg>=0.30",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    # Outbox relay'in yayın katmanı (Phase 11).
+    #
+    # `confluent-kafka` yerine `aiokafka`: ikincisi saf Python ve bu servis
+    # zaten asyncio üzerinde (asyncpg + FastAPI). `confluent-kafka` librdkafka
+    # C kütüphanesine bağlı ve senkron API'si, async bir relay içinde thread
+    # havuzuna atmayı gerektirirdi.
+    "aiokafka>=0.11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -32,6 +32,34 @@ services:
       timeout: 3s
       retries: 20
 
+  # Redpanda — Kafka API'siyle uyumlu broker (ADR 0006, Phase 11).
+  #
+  # ★ NEDEN APACHE KAFKA DEGIL ★
+  # Redpanda tek binary: ZooKeeper ya da KRaft yapilandirmasi yok, JVM yok,
+  # birkac saniyede ayaga kalkiyor. Istemci tarafi Kafka protokolu oldugu icin
+  # uretimde gercek Kafka'ya gecmek yalnizca `KAFKA_BOOTSTRAP` degistirmek —
+  # kod tarafinda hicbir sey degismez.
+  #
+  # `--overprovisioned` ve tek partition: gelistirme makinesinde Redpanda
+  # varsayilan olarak butun CPU'yu rezerve etmeye calisiyor.
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    ports:
+      # Host'tan `rpk` ile bakabilmek icin.
+      - "19092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   redis:
     image: redis:7-alpine
     ports:
@@ -116,6 +144,132 @@ services:
       - ./user-service/migrations:/srv/migrations:ro
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
+  # workout-service — antrenman kaydi (ADR 0005).
+  #
+  # Kendi veritabani `workout_db`. Egzersiz katalogu da burada bir tablo:
+  # ADR 0005 ayri bir exercise-service'i reddetti (statik veri, sifir fayda).
+  workout-service:
+    build:
+      context: ./workout-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/workout_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: workout-service
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+    ports:
+      # Gelistirmede gateway'i atlayarak test etmek icin. Uretimde KALDIRILIR.
+      - "8003:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./workout-service/app:/srv/app:ro
+      - ./workout-service/migrations:/srv/migrations:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # workout-outbox-relay — workout-service'in IKINCI SURECI, ayri servis degil.
+  #
+  # Ayni imaj, ayni veritabani, farkli entrypoint — `auth-email-worker` ile
+  # birebir ayni desen. Ayri bir servis SAYILMAZ (ADR 0005'in bes bileseni
+  # degismedi); yalnizca HTTP istek yolundan ayrilmis bir arka plan isi.
+  #
+  # Neden ayri surec: Kafka yavassa ya da ayakta degilse antrenman KAYDI
+  # etkilenmemeli. Yayin istek icinde yapilsaydi Kafka kritik yola girerdi ve
+  # outbox deseninin varlik sebebi ortadan kalkardi.
+  workout-outbox-relay:
+    build:
+      context: ./workout-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/workout_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: workout-outbox-relay
+      KAFKA_BOOTSTRAP: redpanda:9092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      workout-service:
+        # Şemayı workout-service'in migration'ı kuruyor; relay ondan sonra.
+        condition: service_started
+    volumes:
+      - ./workout-service/app:/srv/app:ro
+    command: python -m app.worker.outbox_relay
+
+  # analytics-service — olay akisindan turetilen OKUMA MODELI (ADR 0006).
+  #
+  # ★ ADR 0005'IN BESINCI BILESENI ★ Phase 10'da "sirada" diye birakilmisti;
+  # tuketecegi olay akisi olmadan kurulmasi anlamsizdi.
+  #
+  # `workout_db`'ye HIC DOKUNMUYOR — verinin tamami Kafka'dan geliyor. Sinirin
+  # gercekten korundugunun kaniti da bu: baglanti dizesi yalnizca analytics_db.
+  analytics-service:
+    build:
+      context: ./analytics-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/analytics_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: analytics-service
+      KAFKA_BOOTSTRAP: redpanda:9092
+    ports:
+      - "8005:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./analytics-service/app:/srv/app:ro
+      - ./analytics-service/migrations:/srv/migrations:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # analytics-consumer — analytics-service'in IKINCI SURECI.
+  #
+  # `REPLAY_MODE=true` ile calistirilirsa `processed_events` kontrolu atlanir ve
+  # akis guncel mantikla bastan yeniden yansitilir (Phase 11 cikis kriteri):
+  #   docker compose exec redpanda rpk group delete analytics-workout-v1
+  #   docker compose run --rm -e REPLAY_MODE=true analytics-consumer
+  analytics-consumer:
+    build:
+      context: ./analytics-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/analytics_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: analytics-consumer
+      KAFKA_BOOTSTRAP: redpanda:9092
+      REPLAY_MODE: ${REPLAY_MODE:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    volumes:
+      - ./analytics-service/app:/srv/app:ro
+      - ./analytics-service/migrations:/srv/migrations:ro
+    command: python -m app.worker.consumer
+
+  # health-service — gunluk saglik kaydi (ADR 0010).
+  #
+  # Kendi veritabani `health_db`. Su takibi burada; uyku ve kilo gecmisi ayni
+  # desende eklenecek. Antrenman sorgu yolunda YER ALMIYOR, yani kimseye
+  # gecikme eklemiyor — ADR 0010'un exercise-service reddinden ayrildigi nokta.
+  health-service:
+    build:
+      context: ./health-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/health_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: health-service
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+    ports:
+      # Gelistirmede gateway'i atlayarak test etmek icin. Uretimde KALDIRILIR.
+      - "8004:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./health-service/app:/srv/app:ro
+      - ./health-service/migrations:/srv/migrations:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
   # E-posta worker'ı — auth-service'in İKİNCİ SÜRECİ, ayrı servis değil.
   # Aynı imaj, aynı veritabanı, farklı entrypoint. ADR 0005 ayrı bir Notification
   # servisi kurulmayacağını söylüyor; bu onunla uyumlu.
@@ -136,6 +290,8 @@ services:
       MAIL_FROM: ${MAIL_FROM:-AI Fitness Coach <no-reply@trainerasistant.local>}
       # Hesap silindiğinde user-service'e haber vermek için (bkz. worker/fanout.py).
       USER_SERVICE_URL: http://user-service:8000
+      WORKOUT_SERVICE_URL: http://workout-service:8000
+      HEALTH_SERVICE_URL: http://health-service:8000
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
     depends_on:
       postgres:
@@ -146,6 +302,8 @@ services:
       user-service:
         # Silme bildirimi buraya gidiyor. Ayakta olmaması ölümcül DEĞİL —
         # outbox satırı yeniden denenir — ama gereksiz hata log'u üretmesin.
+        condition: service_started
+      workout-service:
         condition: service_started
     volumes:
       - ./auth-service/app:/srv/app:ro
@@ -168,6 +326,10 @@ services:
       auth-service:
         condition: service_started
       user-service:
+        condition: service_started
+      workout-service:
+        condition: service_started
+      health-service:
         condition: service_started
     volumes:
       # Gelistirmede yapilandirma degisikligi icin imaji yeniden derlemeye gerek yok:
