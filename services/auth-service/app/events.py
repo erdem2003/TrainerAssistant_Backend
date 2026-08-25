@@ -7,13 +7,6 @@ from __future__ import annotations
 EVENT_EMAIL_VERIFICATION_REQUESTED = "EmailVerificationRequested"
 """Kayıt ya da kod tekrar isteği sonrası. Payload: {email, code, expires_in_seconds}"""
 
-EVENT_REGISTRATION_ATTEMPT_ON_EXISTING = "RegistrationAttemptOnExistingAccount"
-"""Doğrulanmış bir hesaba kayıt denemesi. Payload: {email}
-
-Bu event, kayıt yanıtının bilgi sızdırmamasını mümkün kılan parçadır: uç her
-durumda aynı yanıtı döner, gerçek durum yalnızca adresin SAHİBİNE bildirilir.
-"""
-
 EVENT_PASSWORD_RESET_REQUESTED = "PasswordResetRequested"
 """Parola sıfırlama isteği. Payload: {email, code, expires_in_seconds}"""
 

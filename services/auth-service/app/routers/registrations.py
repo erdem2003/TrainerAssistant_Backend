@@ -16,6 +16,7 @@ from app.errors import (
     code_invalid,
     code_invalidated,
     code_not_found,
+    email_already_registered,
     rate_limited,
 )
 from app.ratelimit import (
@@ -66,26 +67,22 @@ async def register(payload: RegistrationRequest, request: Request) -> AcceptedRe
         async with conn.transaction():
             existing = await users.find_by_email(conn, email)
 
+            # Doğrulanmış hesap: ürün kararıyla kullanıcı DOĞRUDAN
+            # bilgilendiriliyor (bkz. errors.email_already_registered —
+            # enumeration korumasından bilinçli vazgeçiş). Hiçbir şey
+            # değiştirilmiyor ve artık sahibe ayrıca e-posta ATILMIYOR; kayıt
+            # denemesini yapan zaten anında "hesap var" yanıtını görüyor.
+            if existing is not None and existing.is_verified:
+                raise email_already_registered()
+
             if existing is None:
                 user = await users.insert_pending(conn, email, password_hash)
                 await _issue_verification(conn, user.id, email, code_hash, code)
 
-            elif not existing.is_verified:
+            else:
                 updated = await users.overwrite_unverified(conn, existing.id, password_hash)
                 if updated is not None:
                     await _issue_verification(conn, updated.id, email, code_hash, code)
-
-            else:
-                # Doğrulanmış hesap: HİÇBİR ŞEY DEĞİŞMEZ. Yalnızca hesabın
-                # sahibine haber verilir — böylece hem gerçek sahip durumdan
-                # haberdar olur hem de saldırgan yanıttan bir şey öğrenemez.
-                await outbox.enqueue(
-                    conn,
-                    events.EVENT_REGISTRATION_ATTEMPT_ON_EXISTING,
-                    events.TOPIC_AUTH_EMAIL,
-                    partition_key=str(existing.id),
-                    payload={"email": email},
-                )
 
     # Log'da e-posta YOK (service-contract §11).
     logger.info("kayıt isteği işlendi")

@@ -11,7 +11,7 @@ from fastapi import APIRouter, Header, Response, status
 from app.config import settings
 from app.db import db
 from app.errors import ApiError, forbidden
-from app.repo import processed_events, profiles
+from app.repo import calibration, measurements, processed_events, profiles
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,8 @@ async def delete_user_data(
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
 
             deleted = await profiles.delete_by_id(conn, user_id)
+            await measurements.delete_by_user(conn, user_id)
+            await calibration.delete_by_user(conn, user_id)
 
     logger.info(
         "hesap silme işlendi user_id=%s profil_vardi=%s", user_id, deleted

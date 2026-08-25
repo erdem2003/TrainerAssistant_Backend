@@ -15,7 +15,6 @@ from app.events import (
     EVENT_EMAIL_VERIFICATION_REQUESTED,
     EVENT_PASSWORD_CHANGED,
     EVENT_PASSWORD_RESET_REQUESTED,
-    EVENT_REGISTRATION_ATTEMPT_ON_EXISTING,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,22 +55,6 @@ def _verification_message(payload: dict) -> EmailMessage:
     )
     return message
 
-
-def _existing_account_message(payload: dict) -> EmailMessage:
-    """Doğrulanmış bir hesaba kayıt denemesi yapıldığında."""
-    message = EmailMessage()
-    message["From"] = settings.mail_from
-    message["To"] = payload["email"]
-    message["Subject"] = "Hesabın zaten var"
-    message.set_content(
-        "Merhaba,\n\n"
-        "Bu e-posta adresiyle yeni bir hesap açılmaya çalışıldı, ancak zaten bir\n"
-        "hesabın var. Bu sen isen giriş yapabilir, parolanı unuttuysan sıfırlama\n"
-        "isteyebilirsin.\n\n"
-        "Bu isteği sen yapmadıysan bir şey yapmana gerek yok — hesabında hiçbir\n"
-        "değişiklik olmadı.\n"
-    )
-    return message
 
 
 def _password_reset_message(payload: dict) -> EmailMessage:
@@ -123,7 +106,6 @@ def _account_deleted_message(payload: dict) -> EmailMessage:
 
 _BUILDERS = {
     EVENT_EMAIL_VERIFICATION_REQUESTED: _verification_message,
-    EVENT_REGISTRATION_ATTEMPT_ON_EXISTING: _existing_account_message,
     EVENT_PASSWORD_RESET_REQUESTED: _password_reset_message,
     EVENT_PASSWORD_CHANGED: _password_changed_message,
     EVENT_ACCOUNT_DELETED: _account_deleted_message,

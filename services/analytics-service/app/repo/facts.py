@@ -55,6 +55,73 @@ DELETE_BY_USER = "DELETE FROM workout_facts WHERE user_id = $1"
 
 COUNT_ALL = "SELECT COUNT(*) FROM workout_facts"
 
+# B1 — hata dagilimi. `form_errors` `{"HIP_SAG": 3, ...}` seklinde JSONB;
+# jsonb_each_text ile satir satir acilip aralik icinde toplaniyor. Ayni
+# sorguda araliktaki TOPLAM tekrar da doner — yuzdeyi cikaran istemci tarafi.
+SELECT_ERROR_COUNTS = """
+SELECT key AS error_name, SUM(value::int) AS occurrences
+  FROM workout_facts, jsonb_each_text(form_errors)
+ WHERE user_id = $1 AND started_at >= $2 AND started_at < $3
+ GROUP BY key
+ ORDER BY occurrences DESC
+"""
+
+SELECT_TOTAL_REPS_IN_RANGE = """
+SELECT COALESCE(SUM(total_reps), 0) AS total_reps
+  FROM workout_facts
+ WHERE user_id = $1 AND started_at >= $2 AND started_at < $3
+"""
+
+# A2 — rozetler icin tek sorguda toplanan istatistikler.
+# `best_clean_ratio` en az 5 tekrarlik setleri dikkate alir: 1 tekrarlik
+# sansli bir set %100 gorunup rozeti anlamsizlastirmasin diye.
+SELECT_BADGE_STATS = """
+SELECT
+    COALESCE(SUM(total_reps), 0) AS total_reps,
+    MAX(
+        CASE WHEN total_reps >= 5
+             THEN (total_reps - reps_with_errors)::float / total_reps
+        END
+    ) AS best_clean_ratio,
+    EXISTS(
+        SELECT 1 FROM workout_facts WHERE user_id = $1 AND exercise_id = 'squat'
+    ) AS has_squat,
+    EXISTS(
+        SELECT 1 FROM workout_facts
+         WHERE user_id = $1
+           AND EXTRACT(HOUR FROM ((started_at AT TIME ZONE 'UTC') + $2::interval)) < 8
+    ) AS has_early_bird,
+    EXISTS(
+        SELECT 1 FROM workout_facts
+         WHERE user_id = $1
+           AND EXTRACT(HOUR FROM ((started_at AT TIME ZONE 'UTC') + $2::interval)) >= 22
+    ) AS has_night_owl
+  FROM workout_facts
+ WHERE user_id = $1
+"""
+
+SELECT_ACTIVE_LOCAL_DATES = """
+SELECT DISTINCT (((started_at AT TIME ZONE 'UTC') + $2::interval))::date AS local_date
+  FROM workout_facts
+ WHERE user_id = $1
+"""
+
+
+@dataclass(frozen=True)
+class ErrorCountRow:
+    error_name: str
+    occurrences: int
+
+
+@dataclass(frozen=True)
+class BadgeStats:
+    total_reps: int
+    best_clean_ratio: float | None
+    has_squat: bool
+    has_early_bird: bool
+    has_night_owl: bool
+    active_local_dates: list[date]
+
 
 @dataclass(frozen=True)
 class ExerciseDayRow:
@@ -126,3 +193,32 @@ async def delete_by_user(conn: asyncpg.Connection, user_id: uuid.UUID) -> int:
 async def count_all(conn: asyncpg.Connection) -> int:
     """Replay dogrulamasi icin: yeniden oynatma satir sayisini DEGISTIRMEMELI."""
     return await conn.fetchval(COUNT_ALL)
+
+
+async def fetch_error_counts(
+    conn: asyncpg.Connection, user_id: uuid.UUID, start_utc: datetime, end_utc: datetime
+) -> tuple[list[ErrorCountRow], int]:
+    rows = await conn.fetch(SELECT_ERROR_COUNTS, user_id, start_utc, end_utc)
+    total = await conn.fetchval(
+        SELECT_TOTAL_REPS_IN_RANGE, user_id, start_utc, end_utc
+    )
+    return (
+        [ErrorCountRow(error_name=r["error_name"], occurrences=r["occurrences"]) for r in rows],
+        int(total),
+    )
+
+
+async def fetch_badge_stats(
+    conn: asyncpg.Connection, user_id: uuid.UUID, offset_minutes: int
+) -> BadgeStats:
+    offset = timedelta(minutes=offset_minutes)
+    stats_row = await conn.fetchrow(SELECT_BADGE_STATS, user_id, offset)
+    date_rows = await conn.fetch(SELECT_ACTIVE_LOCAL_DATES, user_id, offset)
+    return BadgeStats(
+        total_reps=int(stats_row["total_reps"]),
+        best_clean_ratio=stats_row["best_clean_ratio"],
+        has_squat=stats_row["has_squat"],
+        has_early_bird=stats_row["has_early_bird"],
+        has_night_owl=stats_row["has_night_owl"],
+        active_local_dates=[r["local_date"] for r in date_rows],
+    )

@@ -87,6 +87,24 @@ def invalid_refresh_token() -> ApiError:
     )
 
 
+def email_already_registered() -> ApiError:
+    """Doğrulanmış bir hesaba kayıt denemesi.
+
+    ★ ENUMERATION KORUMASINDAN BİLİNÇLİ VAZGEÇİŞ ★
+    Önceki tasarım her durumda aynı 202 yanıtını dönüyordu (enumeration
+    koruması) ve yalnızca hesap sahibine e-posta atıyordu. Ürün kararıyla bu
+    değiştirildi: kullanıcı kayıt ekranında DOĞRUDAN bilgilendiriliyor, sahibe
+    ayrıca e-posta ATILMIYOR (bkz. registrations.py, mailer.py'den kaldırılan
+    `_existing_account_message`). Bilinen bedel: bu uç artık hangi e-postaların
+    kayıtlı olduğunu denenerek öğrenmeye açık.
+    """
+    return ApiError(
+        status.HTTP_409_CONFLICT,
+        "EMAIL_ALREADY_REGISTERED",
+        "Bu e-postaya ait bir hesap zaten var",
+    )
+
+
 def rate_limited(retry_after: int) -> ApiError:
     return ApiError(
         status.HTTP_429_TOO_MANY_REQUESTS,

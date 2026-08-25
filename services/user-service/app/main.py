@@ -18,7 +18,7 @@ from app.correlation import (
 )
 from app.db import db
 from app.errors import ApiError, api_error_handler, unhandled_error_handler
-from app.routers import health, internal, profiles
+from app.routers import calibration, health, internal, measurements, profiles
 
 logger = logging.getLogger(__name__)
 
@@ -76,4 +76,6 @@ async def validation_handler(_: Request, exc: RequestValidationError) -> JSONRes
 
 app.include_router(health.router)
 app.include_router(profiles.router)
+app.include_router(measurements.router)
+app.include_router(calibration.router)
 app.include_router(internal.router)

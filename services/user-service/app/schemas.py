@@ -69,3 +69,53 @@ class ProfileResponse(BaseModel):
     onboarding_completed_at: int | None
     created_at: int | None
     updated_at: int | None
+
+
+# --- Vücut ölçüsü geçmişi (B6) ----------------------------------------------
+
+class MeasurementIn(BaseModel):
+    """`PUT /v1/measurements` — bir günün ölçümünü ayarlar (upsert).
+
+    Üçü de opsiyonel: kullanıcı yalnızca kiloyu girip diğerlerini
+    atlayabilmeli. En az biri dolu olmalı — hepsi boşsa kaydedilecek bir şey
+    yok demektir.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    weight_kg: float | None = Field(default=None, ge=20, le=350)
+    waist_cm: float | None = Field(default=None, ge=30, le=250)
+    arm_cm: float | None = Field(default=None, ge=10, le=80)
+
+
+class MeasurementOut(BaseModel):
+    date: str
+    weight_kg: float | None
+    waist_cm: float | None
+    arm_cm: float | None
+
+
+class MeasurementRangeOut(BaseModel):
+    entries: list[MeasurementOut]
+
+
+# --- Kişisel kalibrasyon (D1) ------------------------------------------------
+
+class CalibrationIn(BaseModel):
+    """`PUT /v1/calibration/{exercise_id}` — ölçülen değerleri kaydeder."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_count: int = Field(ge=1, le=100)
+    measured_values: dict[str, float] = Field(min_length=1)
+
+
+class CalibrationOut(BaseModel):
+    exercise_id: str
+    sample_count: int
+    measured_values: dict[str, float]
+    calibrated_at: int
+
+
+class CalibrationListOut(BaseModel):
+    profiles: list[CalibrationOut]

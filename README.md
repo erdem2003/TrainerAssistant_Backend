@@ -24,6 +24,25 @@ hareket aralığı, hata *adı*). Gerekçe: ADR 0002.
 
 ---
 
+## Ekranlar
+
+<p>
+  <img src="screenshots/01-anasayfa.png" width="185">
+  <img src="screenshots/02-takvim.png" width="185">
+  <img src="screenshots/03-antremanlar.png" width="185">
+  <img src="screenshots/04-istatistik.png" width="185">
+  <img src="screenshots/05-ayarlar.png" width="185">
+</p>
+
+Soldan sağa: **Anasayfa** (haftalık grafik + günün programı), **Takvim** (gün şeridi),
+**Antremanlar** (egzersiz seçimi), **İstatistik** (kalori, tekrar, temiz tekrar oranı),
+**Ayarlar** (kişisel değerler görüntüde sansürlendi).
+
+Programdaki ilerleme çubukları sunucuda **saklanmıyor**, her istekte antrenman
+kayıtlarından hesaplanıyor — gerekçesi ADR 0012'de.
+
+---
+
 ## Depo yerleşimi
 
 Proje üç klasöre yayılmış:
@@ -178,6 +197,7 @@ Dürüstlük gereği kayıtlı:
 | Feature tanımları | `docs/computer-vision/feature-spec.md` |
 | Eşik ölçüm yöntemi | `docs/computer-vision/threshold-measurement.md` |
 | Faz planı + çıkış kriterleri | `docs/roadmap.md` |
+| Ürün backlog'u + rakip analizi | `docs/product/backlog.md` |
 | Teknik sözleşmeler | `.claude/skills/` |
 
 Testler de depoda değil — kod tabanında 73 backend entegrasyon testi ve `:core`
