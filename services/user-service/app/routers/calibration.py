@@ -12,7 +12,6 @@ import logging
 
 from fastapi import APIRouter, Header
 
-from app.db import db
 from app.errors import unprocessable
 from app.identity import require_user_id
 from app.repo import calibration
@@ -51,10 +50,9 @@ async def put_calibration(
     if exercise_id not in _KNOWN_EXERCISES:
         raise unprocessable("Bilinmeyen egzersiz", {"exercise_id": exercise_id})
 
-    async with db.pool.acquire() as conn:
-        row = await calibration.upsert(
-            conn, user_id, exercise_id, payload.sample_count, payload.measured_values
-        )
+    row = await calibration.upsert(
+        user_id, exercise_id, payload.sample_count, payload.measured_values
+    )
 
     logger.info(
         "kalibrasyon kaydedildi user_id=%s egzersiz=%s örnek=%d",
@@ -66,6 +64,5 @@ async def put_calibration(
 @router.get("", response_model=CalibrationListOut)
 async def get_all(x_user_id: str | None = Header(default=None)) -> CalibrationListOut:
     user_id = require_user_id(x_user_id)
-    async with db.pool.acquire() as conn:
-        rows = await calibration.fetch_all(conn, user_id)
+    rows = await calibration.fetch_all(user_id)
     return CalibrationListOut(profiles=[_to_out(row) for row in rows])

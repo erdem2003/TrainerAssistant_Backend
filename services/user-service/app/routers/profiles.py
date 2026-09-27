@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Header
 
-from app.db import db
 from app.identity import require_user_id
 from app.repo import profiles
 from app.schemas import ProfileResponse, ProfileUpdate, UnitSystem
@@ -65,8 +64,7 @@ def _to_response(user_id: str, profile: profiles.Profile | None) -> ProfileRespo
 async def get_me(x_user_id: str | None = Header(default=None)) -> ProfileResponse:
     user_id = require_user_id(x_user_id)
 
-    async with db.pool.acquire() as conn:
-        profile = await profiles.find_by_id(conn, user_id)
+    profile = await profiles.find_by_id(user_id)
 
     return _to_response(str(user_id), profile)
 
@@ -85,19 +83,17 @@ async def put_me(
         datetime.now(timezone.utc) if payload.onboarding_completed else None
     )
 
-    async with db.pool.acquire() as conn:
-        profile = await profiles.upsert(
-            conn,
-            user_id,
-            sex=payload.sex.value if payload.sex else None,
-            age=payload.age,
-            weight_kg=payload.weight_kg,
-            height_cm=payload.height_cm,
-            goal=payload.goal.value if payload.goal else None,
-            unit_system=payload.unit_system.value,
-            daily_goal_reps=payload.daily_goal_reps,
-            onboarding_completed_at=completed_at,
-        )
+    profile = await profiles.upsert(
+        user_id,
+        sex=payload.sex.value if payload.sex else None,
+        age=payload.age,
+        weight_kg=payload.weight_kg,
+        height_cm=payload.height_cm,
+        goal=payload.goal.value if payload.goal else None,
+        unit_system=payload.unit_system.value,
+        daily_goal_reps=payload.daily_goal_reps,
+        onboarding_completed_at=completed_at,
+    )
 
     logger.info("profil güncellendi user_id=%s", user_id)
     return _to_response(str(user_id), profile)

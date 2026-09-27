@@ -1,48 +1,14 @@
-"""profiles tablosunun SQL'i."""
+"""Profil — `user_users/{user_id}` kök dokümanı."""
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
-import asyncpg
+from google.cloud import firestore
 
-_SELECT_BY_ID = """
-SELECT user_id, sex, age, weight_kg, height_cm, goal,
-       unit_system, daily_goal_reps, onboarding_completed_at,
-       created_at, updated_at
-  FROM profiles
- WHERE user_id = $1
-"""
-
-# UPSERT — profil satırı TEMBEL oluşturuluyor.
-_UPSERT = """
-INSERT INTO profiles (
-    user_id, sex, age, weight_kg, height_cm, goal,
-    unit_system, daily_goal_reps, onboarding_completed_at, updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
-ON CONFLICT (user_id) DO UPDATE SET
-    sex                     = EXCLUDED.sex,
-    age                     = EXCLUDED.age,
-    weight_kg               = EXCLUDED.weight_kg,
-    height_cm               = EXCLUDED.height_cm,
-    goal                    = EXCLUDED.goal,
-    unit_system             = EXCLUDED.unit_system,
-    daily_goal_reps         = EXCLUDED.daily_goal_reps,
-    -- BİR KEZ YAZILIR, SONRA KORUNUR: kullanıcı profilini sonradan
-    -- düzenlediğinde onboarding tarihi güncellenmemeli — o, akışın ne zaman
-    -- tamamlandığını söyleyen bir kayıt, son düzenleme zamanı değil
-    -- (onun için `updated_at` var).
-    onboarding_completed_at = COALESCE(profiles.onboarding_completed_at,
-                                       EXCLUDED.onboarding_completed_at),
-    updated_at              = now()
-RETURNING user_id, sex, age, weight_kg, height_cm, goal,
-          unit_system, daily_goal_reps, onboarding_completed_at,
-          created_at, updated_at
-"""
-
-_DELETE_BY_ID = "DELETE FROM profiles WHERE user_id = $1"
+from app.db import db, user_doc
 
 
 @dataclass(frozen=True)
@@ -60,29 +26,31 @@ class Profile:
     updated_at: datetime
 
 
-def _to_profile(row: asyncpg.Record) -> Profile:
+def _to_profile(user_id: uuid.UUID, data: dict) -> Profile:
     return Profile(
-        user_id=row["user_id"],
-        sex=row["sex"],
-        age=row["age"],
-        weight_kg=row["weight_kg"],
-        height_cm=row["height_cm"],
-        goal=row["goal"],
-        unit_system=row["unit_system"],
-        daily_goal_reps=row["daily_goal_reps"],
-        onboarding_completed_at=row["onboarding_completed_at"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+        user_id=user_id,
+        sex=data.get("sex"),
+        age=data.get("age"),
+        weight_kg=data.get("weight_kg"),
+        height_cm=data.get("height_cm"),
+        goal=data.get("goal"),
+        unit_system=data.get("unit_system", "METRIC"),
+        daily_goal_reps=int(data.get("daily_goal_reps", 20)),
+        onboarding_completed_at=data.get("onboarding_completed_at"),
+        created_at=data["created_at"],
+        updated_at=data["updated_at"],
     )
 
 
-async def find_by_id(conn: asyncpg.Connection, user_id: uuid.UUID) -> Profile | None:
-    row = await conn.fetchrow(_SELECT_BY_ID, user_id)
-    return _to_profile(row) if row else None
+async def find_by_id(user_id: uuid.UUID) -> Profile | None:
+    snap = await user_doc(user_id).get()
+    data = snap.to_dict() if snap.exists else None
+    if not data or "created_at" not in data:
+        return None
+    return _to_profile(user_id, data)
 
 
 async def upsert(
-    conn: asyncpg.Connection,
     user_id: uuid.UUID,
     *,
     sex: str | None,
@@ -94,22 +62,38 @@ async def upsert(
     daily_goal_reps: int,
     onboarding_completed_at: datetime | None,
 ) -> Profile:
-    row = await conn.fetchrow(
-        _UPSERT,
-        user_id,
-        sex,
-        age,
-        weight_kg,
-        height_cm,
-        goal,
-        unit_system,
-        daily_goal_reps,
-        onboarding_completed_at,
-    )
-    return _to_profile(row)
+    """Profili TAM değiştirir; doküman yoksa oluşturur.
 
+    ★ TRANSACTION ★ İki alan korunuyor ve ikisi de mevcut değeri okumayı
+    gerektiriyor: `created_at` (ilk yazımın zamanı) ve
+    `onboarding_completed_at` (BİR KEZ yazılır — Postgres'teki
+    `COALESCE(profiles.onboarding_completed_at, EXCLUDED...)`). Oku-sonra-yaz
+    transaction dışında yapılsaydı iki paralel PUT birbirinin tarihini ezebilirdi.
 
-async def delete_by_id(conn: asyncpg.Connection, user_id: uuid.UUID) -> bool:
-    """Satırı siler. Satır yoksa `False` döner ama bu bir hata DEĞİL."""
-    result = await conn.execute(_DELETE_BY_ID, user_id)
-    return result != "DELETE 0"
+    Zaman damgaları `SERVER_TIMESTAMP` değil sürecin saatiyle yazılıyor: yanıt
+    aynı değerleri döndürmek zorunda ve sunucu damgası yazımdan sonra ikinci
+    bir okuma isterdi.
+    """
+    ref = user_doc(user_id)
+    now = datetime.now(timezone.utc)
+
+    @firestore.async_transactional
+    async def run(tx) -> dict:
+        snap = await ref.get(transaction=tx)
+        current = (snap.to_dict() or {}) if snap.exists else {}
+        data = {
+            "sex": sex,
+            "age": age,
+            "weight_kg": weight_kg,
+            "height_cm": height_cm,
+            "goal": goal,
+            "unit_system": unit_system,
+            "daily_goal_reps": daily_goal_reps,
+            "onboarding_completed_at": current.get("onboarding_completed_at") or onboarding_completed_at,
+            "created_at": current.get("created_at") or now,
+            "updated_at": now,
+        }
+        tx.set(ref, data)
+        return data
+
+    return _to_profile(user_id, await run(db.client.transaction()))

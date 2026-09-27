@@ -7,7 +7,6 @@ from datetime import date
 
 from fastapi import APIRouter, Header, Query
 
-from app.db import db
 from app.errors import unprocessable
 from app.identity import require_user_id
 from app.repo import measurements
@@ -42,10 +41,9 @@ async def set_measurement(
     if payload.weight_kg is None and payload.waist_cm is None and payload.arm_cm is None:
         raise unprocessable("En az bir ölçü değeri gerekli")
 
-    async with db.pool.acquire() as conn:
-        row = await measurements.upsert(
-            conn, user_id, target, payload.weight_kg, payload.waist_cm, payload.arm_cm
-        )
+    row = await measurements.upsert(
+        user_id, target, payload.weight_kg, payload.waist_cm, payload.arm_cm
+    )
 
     logger.info("ölçüm kaydedildi user_id=%s gün=%s", user_id, target)
     return MeasurementOut(
@@ -72,8 +70,7 @@ async def get_range(
     if (last - first).days + 1 > _MAX_RANGE_DAYS:
         raise unprocessable("Aralık çok geniş", {"max_days": _MAX_RANGE_DAYS})
 
-    async with db.pool.acquire() as conn:
-        rows = await measurements.fetch_range(conn, user_id, first, last)
+    rows = await measurements.fetch_range(user_id, first, last)
 
     return MeasurementRangeOut(
         entries=[
