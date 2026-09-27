@@ -14,16 +14,10 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "asyncpg>=0.30",
+    "google-cloud-firestore>=2.19",
+    "firebase-admin>=6.6",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
-    # Outbox relay'in yayın katmanı (Phase 11).
-    #
-    # `confluent-kafka` yerine `aiokafka`: ikincisi saf Python ve bu servis
-    # zaten asyncio üzerinde (asyncpg + FastAPI). `confluent-kafka` librdkafka
-    # C kütüphanesine bağlı ve senkron API'si, async bir relay içinde thread
-    # havuzuna atmayı gerektirirdi.
-    "aiokafka>=0.11",
 ]
 
 [project.optional-dependencies]

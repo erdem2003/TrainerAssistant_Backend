@@ -11,7 +11,6 @@ from datetime import date
 
 from fastapi import APIRouter, Header, Query
 
-from app.db import db
 from app.errors import unprocessable
 from app.identity import require_user_id
 from app.localday import check_offset, parse_date, range_bounds
@@ -48,9 +47,7 @@ async def get_daily_stats(
 
     start, end = range_bounds(first, last, offset)
 
-    async with db.pool.acquire() as conn:
-        rows = await stats.fetch_daily(conn, user_id, offset, start, end)
-        error_rows = await stats.fetch_daily_errors(conn, user_id, offset, start, end)
+    rows, error_rows = await stats.fetch_daily(user_id, offset, start, end)
 
     # Gün → egzersiz kırılımı. `rows` gün+egzersiz granülaritesinde geliyor;
     # günün toplamları egzersizler toplanarak çıkıyor. Sunucuda ayrı bir toplam

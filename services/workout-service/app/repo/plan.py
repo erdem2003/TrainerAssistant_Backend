@@ -1,7 +1,11 @@
-"""plan_items tablosunun SQL'i — gunluk antrenman programi.
+"""Günlük antrenman programı — `workout_users/{uid}/plan/{yyyy-MM-dd}`.
 
-Tamamlanma BU TABLODA TUTULMUYOR; `done_reps()` ile antrenman kayitlarindan
-turetiliyor. Gerekcesi migrations/003_plan.sql basinda yazili.
+Gün başına TEK doküman, kalemler sıralı bir dizi: `{items: [...]}`. Postgres'te
+`(user_id, scheduled_date, exercise_id)` UNIQUE ve `position` kolonu vardı;
+burada benzersizlik şemada (PlanDayIn) doğrulanıyor, sıra dizinin kendisi.
+
+Tamamlanma BU DOKÜMANDA TUTULMUYOR (ADR 0012); `done_reps()` ile antrenman
+kayıtlarından türetiliyor.
 """
 
 from __future__ import annotations
@@ -10,76 +14,11 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
-import asyncpg
+from google.cloud import firestore
+from google.cloud.firestore_v1.field_path import FieldPath
 
-# --- Okuma ------------------------------------------------------------------
-
-SELECT_DAY = """
-SELECT id, exercise_id, target_reps, scheduled_time, position
-  FROM plan_items
- WHERE user_id = $1 AND scheduled_date = $2
- ORDER BY position
-"""
-
-SELECT_RANGE = """
-SELECT scheduled_date, exercise_id, target_reps, scheduled_time, position
-  FROM plan_items
- WHERE user_id = $1 AND scheduled_date BETWEEN $2 AND $3
- ORDER BY scheduled_date, position
-"""
-
-# ★ TAMAMLANMANIN TEK KAYNAGI ★
-#
-# Tekrarlar SAYILIYOR, toplanmiyor: `reps` tablosunda tekrar basina bir satir
-# var (001_initial.sql §reps), yani COUNT dogrudan tekrar sayisi demek.
-#
-# Gun siniri PARAMETRE olarak geliyor (UTC yarim acik aralik), cunku sunucu
-# istemcinin saat dilimini bilmiyor. Burada `DATE(started_at)` kullanmak,
-# Istanbul'da gece 01:00'de yapilan antrenmani bir onceki gune yazardi.
-SELECT_DONE_REPS = """
-SELECT w.exercise_id, COUNT(r.id) AS done_reps
-  FROM workouts w
-  JOIN sets s ON s.workout_id = w.id
-  JOIN reps r ON r.set_id = s.id
- WHERE w.user_id = $1 AND w.started_at >= $2 AND w.started_at < $3
- GROUP BY w.exercise_id
-"""
-
-# Aralik icin ayni sayim, ama gune gore gruplanmis.
-#
-# Gun etiketi `w.started_at`'e saat dilimi farki EKLENEREK cikariliyor: sunucu
-# UTC saklıyor, kullanicinin takvimi kaymis durumda. `$2` interval olarak
-# geliyor (ornegin '180 minutes').
-#
-# ★ `AT TIME ZONE 'UTC'` ATLANMAZ ★
-# `timestamptz::date` donusumu Postgres'in OTURUM saat dilimini (`TimeZone` GUC)
-# kullanir. Konteynerde bu genelde UTC'dir ama garanti degil ve degistiginde
-# gun etiketleri sessizce kayardi — hata da vermezdi. `AT TIME ZONE 'UTC'`
-# once naif bir `timestamp` uretiyor; ondan sonraki `::date` saat diliminden
-# tamamen bagimsiz.
-SELECT_DONE_REPS_RANGE = """
-SELECT (((w.started_at AT TIME ZONE 'UTC') + $2::interval))::date AS local_date,
-       w.exercise_id,
-       COUNT(r.id) AS done_reps
-  FROM workouts w
-  JOIN sets s ON s.workout_id = w.id
-  JOIN reps r ON r.set_id = s.id
- WHERE w.user_id = $1 AND w.started_at >= $3 AND w.started_at < $4
- GROUP BY local_date, w.exercise_id
-"""
-
-# --- Yazma ------------------------------------------------------------------
-
-DELETE_DAY = "DELETE FROM plan_items WHERE user_id = $1 AND scheduled_date = $2"
-
-INSERT_ITEM = """
-INSERT INTO plan_items
-       (user_id, scheduled_date, exercise_id, target_reps, scheduled_time, position)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id
-"""
-
-DELETE_BY_USER = "DELETE FROM plan_items WHERE user_id = $1"
+from app.db import user_doc
+from app.repo import workouts
 
 
 @dataclass(frozen=True)
@@ -100,106 +39,114 @@ class PlanRangeRow:
     position: int
 
 
-async def fetch_day(
-    conn: asyncpg.Connection, user_id: uuid.UUID, day: date
-) -> list[PlanRow]:
-    rows = await conn.fetch(SELECT_DAY, user_id, day)
+def _col(user_id: uuid.UUID):
+    return user_doc(user_id).collection("plan")
+
+
+def _parse_time(raw: str | None) -> time | None:
+    return time.fromisoformat(raw) if raw else None
+
+
+def _rows(items: list[dict]) -> list[PlanRow]:
     return [
         PlanRow(
-            id=row["id"],
-            exercise_id=row["exercise_id"],
-            target_reps=row["target_reps"],
-            scheduled_time=row["scheduled_time"],
-            position=row["position"],
+            id=uuid.UUID(item["id"]),
+            exercise_id=item["exercise_id"],
+            target_reps=int(item["target_reps"]),
+            scheduled_time=_parse_time(item.get("scheduled_time")),
+            position=int(item["position"]),
         )
-        for row in rows
+        for item in sorted(items, key=lambda x: x["position"])
     ]
 
 
-async def fetch_range(
-    conn: asyncpg.Connection, user_id: uuid.UUID, start: date, end: date
-) -> list[PlanRangeRow]:
-    rows = await conn.fetch(SELECT_RANGE, user_id, start, end)
-    return [
-        PlanRangeRow(
-            scheduled_date=row["scheduled_date"],
-            exercise_id=row["exercise_id"],
-            target_reps=row["target_reps"],
-            scheduled_time=row["scheduled_time"],
-            position=row["position"],
-        )
-        for row in rows
-    ]
+async def fetch_day(user_id: uuid.UUID, day: date) -> list[PlanRow]:
+    snap = await _col(user_id).document(day.isoformat()).get()
+    return _rows(snap.get("items") or []) if snap.exists else []
 
 
-async def done_reps(
-    conn: asyncpg.Connection,
-    user_id: uuid.UUID,
-    start_utc: datetime,
-    end_utc: datetime,
-) -> dict[str, int]:
-    """`exercise_id` -> o gun yapilan tekrar sayisi."""
-    rows = await conn.fetch(SELECT_DONE_REPS, user_id, start_utc, end_utc)
-    return {row["exercise_id"]: row["done_reps"] for row in rows}
+async def fetch_range(user_id: uuid.UUID, start: date, end: date) -> list[PlanRangeRow]:
+    col = _col(user_id)
+    query = (
+        col.where(filter=firestore.FieldFilter(FieldPath.document_id(), ">=", col.document(start.isoformat())))
+        .where(filter=firestore.FieldFilter(FieldPath.document_id(), "<=", col.document(end.isoformat())))
+        .order_by(FieldPath.document_id())
+    )
+    result: list[PlanRangeRow] = []
+    async for snap in query.stream():
+        day = date.fromisoformat(snap.id)
+        for row in _rows(snap.get("items") or []):
+            result.append(
+                PlanRangeRow(
+                    scheduled_date=day,
+                    exercise_id=row.exercise_id,
+                    target_reps=row.target_reps,
+                    scheduled_time=row.scheduled_time,
+                    position=row.position,
+                )
+            )
+    return result
+
+
+async def done_reps(user_id: uuid.UUID, start_utc: datetime, end_utc: datetime) -> dict[str, int]:
+    """`exercise_id` -> o gün yapılan tekrar sayısı.
+
+    ★ TAMAMLANMANIN TEK KAYNAĞI ★ Gün sınırı PARAMETRE (UTC yarım açık aralık);
+    sunucu istemcinin saat dilimini bilmiyor.
+    """
+    result: dict[str, int] = {}
+    for w in await workouts.fetch_between(user_id, start_utc, end_utc):
+        result[w.exercise_id] = result.get(w.exercise_id, 0) + w.total_reps
+    return result
 
 
 async def done_reps_by_day(
-    conn: asyncpg.Connection,
     user_id: uuid.UUID,
     offset_minutes: int,
     start_utc: datetime,
     end_utc: datetime,
 ) -> dict[date, dict[str, int]]:
-    """`yerel gun` -> (`exercise_id` -> tekrar). Gun seridi isaretleri icin.
+    """`yerel gün` -> (`exercise_id` -> tekrar). Gün şeridi işaretleri için.
 
-    Saat dilimi farki `timedelta` OLARAK geciliyor, metin olarak degil: asyncpg
-    `interval` parametresini `timedelta`'dan kodluyor ve `'180 minutes'` gibi bir
-    metin `AttributeError: 'str' object has no attribute 'days'` veriyor.
-    `$2::interval` cast'i bunu kurtarmiyor cunku hata SQL'e gitmeden, parametre
-    kodlanirken olusuyor.
+    Gün etiketi UTC zamana saat dilimi farkı EKLENEREK çıkarılıyor —
+    Postgres'teki `(started_at AT TIME ZONE 'UTC' + offset)::date`'in aynısı.
     """
-    rows = await conn.fetch(
-        SELECT_DONE_REPS_RANGE,
-        user_id,
-        timedelta(minutes=offset_minutes),
-        start_utc,
-        end_utc,
-    )
+    offset = timedelta(minutes=offset_minutes)
     result: dict[date, dict[str, int]] = {}
-    for row in rows:
-        result.setdefault(row["local_date"], {})[row["exercise_id"]] = row["done_reps"]
+    for w in await workouts.fetch_between(user_id, start_utc, end_utc):
+        local = (w.started_at + offset).date()
+        bucket = result.setdefault(local, {})
+        bucket[w.exercise_id] = bucket.get(w.exercise_id, 0) + w.total_reps
     return result
 
 
-async def replace_day(
-    conn: asyncpg.Connection,
-    user_id: uuid.UUID,
-    day: date,
-    items: list,
-) -> None:
-    """Gunun listesini KOMPLE degistirir.
+async def replace_day(user_id: uuid.UUID, day: date, items: list) -> None:
+    """Günün listesini KOMPLE değiştirir.
 
-    KISMI GUNCELLEME YOK (profil ucuyla ayni desen): istemci elindeki tam
-    listeyi yaziyor. Boylece ekleme, silme ve siralama TEK istekte cozuluyor ve
-    ucun kendisi dogal olarak idempotent oluyor.
+    Tek dokümanın `set()`'i atomik: Postgres'te "önce sil, sonra ekle" iki adımı
+    bir transaction'a sarmak gerekiyordu, burada doğal olarak tek yazım. Boş
+    liste dokümanı siler — aralık sorgusu boş günü göstermesin (Postgres'te o
+    güne ait satır kalmıyordu).
 
-    CAGIRAN TARAF TRANSACTION ACMALI: silme basarili olup ekleme patlarsa
-    kullanicinin programi sessizce silinmis olurdu.
+    Kalem kimlikleri her yazımda YENİ (Postgres'te de sil+ekle yeni UUID
+    üretiyordu).
     """
-    await conn.execute(DELETE_DAY, user_id, day)
-    for position, item in enumerate(items, start=1):
-        await conn.execute(
-            INSERT_ITEM,
-            user_id,
-            day,
-            item.exercise_id,
-            item.target_reps,
-            item.scheduled_time,
-            position,
-        )
-
-
-async def delete_by_user(conn: asyncpg.Connection, user_id: uuid.UUID) -> int:
-    """Hesap silme zinciri — kullanicinin tum plan kalemleri."""
-    result = await conn.execute(DELETE_BY_USER, user_id)
-    return int(result.rsplit(" ", 1)[1])
+    ref = _col(user_id).document(day.isoformat())
+    if not items:
+        await ref.delete()
+        return
+    await ref.set(
+        {
+            "items": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "exercise_id": item.exercise_id,
+                    "target_reps": item.target_reps,
+                    "scheduled_time": item.scheduled_time.isoformat() if item.scheduled_time else None,
+                    "position": position,
+                }
+                for position, item in enumerate(items, start=1)
+            ],
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+    )

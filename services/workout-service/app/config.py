@@ -25,13 +25,17 @@ class Settings(BaseSettings):
     page_size_default: int = 50
     page_size_max: int = 200
 
-    # --- Outbox relay (Phase 11) --------------------------------------------
-    # Degerler `auth-service` ile ayni: iki relay ayni deseni izliyor ve farkli
-    # ayarlarda calismalarinin bir gerekcesi yok.
-    kafka_bootstrap: str = "redpanda:9092"
-    outbox_poll_seconds: float = 1.0
-    outbox_batch_size: int = 20
+    # --- Firestore outbox dagiticisi (ADR 0019) ------------------------------
+    # Yoklama YEDEK yol: yeni olay commit'ten hemen sonra `notify()` ile
+    # dagitiliyor. Bos yoklama da 1 okuma sayildigi icin aralik uzun — 60 sn
+    # gunde ~1.440 okuma (ucretsiz kota 50k/gun). Gerekce: nabiz_firebase/outbox.py.
+    outbox_poll_seconds: float = 60.0
+    outbox_batch_size: int = 50
     outbox_max_attempts: int = 5
+    # Dagiticiyi bu surecte baslat. Tek surecli dagitimda yalnizca BIR yerde
+    # acik olmali; ayni koleksiyonu iki surec dagitirsa teslim yine
+    # idempotent ama bosuna iki kat okuma olur.
+    outbox_dispatcher_enabled: bool = True
 
 
 @lru_cache

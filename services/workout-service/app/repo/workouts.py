@@ -1,112 +1,32 @@
-"""workouts / sets / reps / rep_form_errors tablolarinin SQL'i."""
+"""Antrenman — `workout_users/{uid}/workouts/{wid}` + küresel kimlik kaydı.
+
+Postgres'teki workouts/sets/reps/rep_form_errors tabloları tek dokümanda
+(yerleşim gerekçesi `app/db.py`).
+"""
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
-import asyncpg
+from google.cloud import firestore
+from google.cloud.firestore_v1.field_path import FieldPath
 
-# --- Yazma ------------------------------------------------------------------
+from app.db import db, user_doc
 
-# ON CONFLICT DO NOTHING: ayni id ikinci kez geldiginde YENI SATIR ACILMAZ ve
-# hata da firlatilmaz. Cagiran taraf donen satirin bos olmasindan "bu bir tekrar"
-# sonucunu cikarir ve icerik ozetini karsilastirir (service-contract §4).
-INSERT_WORKOUT = """
-INSERT INTO workouts (id, user_id, exercise_id, started_at, ended_at, content_hash)
-VALUES ($1, $2, $3, $4, $5, $6)
-ON CONFLICT (id) DO NOTHING
-RETURNING id
-"""
-
-INSERT_SET = """
-INSERT INTO sets (workout_id, set_index, started_at, ended_at)
-VALUES ($1, $2, $3, $4)
-RETURNING id
-"""
-
-INSERT_REP = """
-INSERT INTO reps (set_id, rep_index, duration_s, eccentric_s, concentric_s, rom)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id
-"""
-
-INSERT_FORM_ERROR = """
-INSERT INTO rep_form_errors (rep_id, error)
-VALUES ($1, $2)
-ON CONFLICT DO NOTHING
-"""
-
-# --- Okuma ------------------------------------------------------------------
-
-SELECT_OWNER_AND_HASH = """
-SELECT user_id, content_hash FROM workouts WHERE id = $1
-"""
-
-# Tek antrenmanin tamami. Setler ve tekrarlar TEK SORGUDA aliniyor:
-# set basina ayri sorgu atmak N+1 olurdu ve 10 setlik bir antrenman 11 gidis
-# donus demekti.
-SELECT_WORKOUT_DETAIL = """
-SELECT w.id, w.exercise_id, w.started_at, w.ended_at,
-       s.set_index, s.started_at AS set_started, s.ended_at AS set_ended,
-       r.id AS rep_id, r.rep_index, r.duration_s, r.eccentric_s,
-       r.concentric_s, r.rom,
-       e.error
-  FROM workouts w
-  LEFT JOIN sets s ON s.workout_id = w.id
-  LEFT JOIN reps r ON r.set_id = s.id
-  LEFT JOIN rep_form_errors e ON e.rep_id = r.id
- WHERE w.id = $1 AND w.user_id = $2
- ORDER BY s.set_index, r.rep_index, e.error
-"""
-
-# Gecmis listesi — cursor sayfalama (service-contract §5).
-#
-# NEDEN OFFSET DEGIL: offset sayfalama, araya yeni kayit girdiginde satir atlar
-# veya tekrarlar. Antrenman listesi tam olarak boyle bir liste — en yeni ustte ve
-# surekli ekleniyor.
-#
-# `(started_at, id) < (cursor_started_at, cursor_id)` bilesik karsilastirmasi,
-# ayni anda baslamis iki antrenmanda bile kararli bir sira uretiyor.
-SELECT_WORKOUT_PAGE = """
-SELECT w.id, w.exercise_id, w.started_at, w.ended_at,
-       COUNT(DISTINCT s.id)                                   AS total_sets,
-       COUNT(DISTINCT r.id)                                   AS total_reps,
-       COUNT(DISTINCT r.id) FILTER (WHERE e.rep_id IS NOT NULL) AS reps_with_errors,
-       -- ★ ALT SORGU, ANA JOIN'DE SUM DEGIL ★
-       -- Bu sorgu set × tekrar × hata kartezyeni uretiyor; set surelerini ana
-       -- JOIN icinde toplamak her seti tekrar sayisi kadar sayar ve degeri kat
-       -- kat sisirirdi. `COUNT(DISTINCT ...)` bu tuzagi sayimlar icin cozuyor
-       -- ama TOPLAMA icin DISTINCT bir cozum degil.
-       COALESCE((
-           SELECT SUM(EXTRACT(EPOCH FROM (s2.ended_at - s2.started_at)))
-             FROM sets s2 WHERE s2.workout_id = w.id
-       ), 0)                                                  AS active_seconds,
-       -- Bu antrenmandaki EN KALABALIK setin tekrar sayisi.
-       -- Kisisel rekor ("tek sette en cok tekrar") yalnizca bu sayidan
-       -- hesaplanabiliyor; liste yaniti set kirilimini tasimiyor ve her
-       -- antrenmanin ayrintisini cekmek 200 istek demekti.
-       COALESCE((
-           SELECT MAX(cnt) FROM (
-               SELECT COUNT(r3.id) AS cnt
-                 FROM sets s3 LEFT JOIN reps r3 ON r3.set_id = s3.id
-                WHERE s3.workout_id = w.id
-                GROUP BY s3.id
-           ) per_set
-       ), 0)                                                  AS best_set_reps
-  FROM workouts w
-  LEFT JOIN sets s ON s.workout_id = w.id
-  LEFT JOIN reps r ON r.set_id = s.id
-  LEFT JOIN rep_form_errors e ON e.rep_id = r.id
- WHERE w.user_id = $1
-   AND ($2::timestamptz IS NULL OR (w.started_at, w.id) < ($2, $3))
- GROUP BY w.id
- ORDER BY w.started_at DESC, w.id DESC
- LIMIT $4
-"""
-
-DELETE_BY_USER = "DELETE FROM workouts WHERE user_id = $1"
+# Liste/istatistik/plan sorgularının çektiği alanlar — setler/tekrarlar HARİÇ.
+SUMMARY_FIELDS = [
+    "exercise_id",
+    "started_at",
+    "ended_at",
+    "total_sets",
+    "total_reps",
+    "reps_with_errors",
+    "active_seconds",
+    "best_set_reps",
+    "form_errors",
+]
 
 
 @dataclass(frozen=True)
@@ -124,100 +44,157 @@ class WorkoutSummaryRow:
     total_sets: int
     total_reps: int
     reps_with_errors: int
-    # Setlerin toplam suresi — setler ARASI dinlenme HARIC. Kalori girdisi.
+    # Setlerin toplam süresi — setler ARASI dinlenme HARİÇ. Kalori girdisi.
     active_seconds: float
-    # Bu antrenmandaki en kalabalik setin tekrar sayisi (kisisel rekor icin).
+    # Bu antrenmandaki en kalabalık setin tekrar sayısı (kişisel rekor için).
     best_set_reps: int
+    # hata türü -> kaç tekrarda görüldü
+    form_errors: dict[str, int]
 
 
-async def find_existing(
-    conn: asyncpg.Connection, workout_id: uuid.UUID
-) -> ExistingWorkout | None:
-    row = await conn.fetchrow(SELECT_OWNER_AND_HASH, workout_id)
-    if row is None:
-        return None
-    return ExistingWorkout(user_id=row["user_id"], content_hash=row["content_hash"])
+def workouts_col(user_id: uuid.UUID):
+    return user_doc(user_id).collection("workouts")
 
 
-async def insert_full(
-    conn: asyncpg.Connection,
+def registry_ref(workout_id: uuid.UUID):
+    return db.collection("workout_ids").document(str(workout_id))
+
+
+def _ms_to_dt(value: int | None) -> datetime | None:
+    return None if value is None else datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+
+
+def build_document(
     *,
-    workout_id: uuid.UUID,
     user_id: uuid.UUID,
     exercise_id: str,
-    started_at: datetime,
-    ended_at: datetime | None,
+    started_at_ms: int,
+    ended_at_ms: int | None,
     content_hash: str,
     sets: list,
-) -> bool:
-    """Antrenmani setleri ve tekrarlariyla birlikte yazar.
+) -> dict:
+    """İstek gövdesinden antrenman dokümanı + önceden hesaplanmış toplamlar.
 
-    `True` = yeni kayit acildi. `False` = bu id zaten vardi, hicbir sey yazilmadi.
-
-    CAGIRAN TARAF TRANSACTION ACMALI: yarim yazilmis bir antrenman (setleri olan
-    ama tekrarlari olmayan) sessizce yanlis veri olurdu.
+    Toplamlar Postgres sorgularının birebir karşılığı:
+      total_reps       COUNT(reps)
+      reps_with_errors en az bir hatası olan tekrar (tekrar başına EN FAZLA bir)
+      active_seconds   SUM(set.ended_at - set.started_at) — dinlenme hariç
+      best_set_reps    en kalabalık setin tekrar sayısı
+      form_errors      hata türü -> tekrar sayısı (rep_form_errors satır sayısı)
     """
-    created = await conn.fetchval(
-        INSERT_WORKOUT, workout_id, user_id, exercise_id,
-        started_at, ended_at, content_hash,
-    )
-    if created is None:
-        return False
-
-    for set_in in sets:
-        set_id = await conn.fetchval(
-            INSERT_SET, workout_id, set_in.index,
-            set_in.started_at, set_in.ended_at,
-        )
-        for rep in set_in.reps:
-            rep_id = await conn.fetchval(
-                INSERT_REP, set_id, rep.index, rep.duration_seconds,
-                rep.eccentric_seconds, rep.concentric_seconds, rep.rom,
+    set_docs = []
+    form_errors: dict[str, int] = {}
+    reps_with_errors = 0
+    for s in sorted(sets, key=lambda x: x.index):
+        rep_docs = []
+        for r in sorted(s.reps, key=lambda x: x.index):
+            errors = sorted(set(r.form_errors))
+            if errors:
+                reps_with_errors += 1
+            for error in errors:
+                form_errors[error] = form_errors.get(error, 0) + 1
+            rep_docs.append(
+                {
+                    "index": r.index,
+                    "duration_seconds": r.duration_seconds,
+                    "eccentric_seconds": r.eccentric_seconds,
+                    "concentric_seconds": r.concentric_seconds,
+                    "rom": r.rom,
+                    "form_errors": errors,
+                }
             )
-            for error in rep.form_errors:
-                await conn.execute(INSERT_FORM_ERROR, rep_id, error)
+        set_docs.append({"index": s.index, "started_at": s.started_at, "ended_at": s.ended_at, "reps": rep_docs})
 
-    return True
+    return {
+        "user_id": str(user_id),
+        "exercise_id": exercise_id,
+        "started_at": _ms_to_dt(started_at_ms),
+        "ended_at": _ms_to_dt(ended_at_ms),
+        "content_hash": content_hash,
+        "total_sets": len(set_docs),
+        "total_reps": sum(len(s["reps"]) for s in set_docs),
+        "reps_with_errors": reps_with_errors,
+        "active_seconds": sum((s["ended_at"] - s["started_at"]) / 1000.0 for s in set_docs),
+        "best_set_reps": max((len(s["reps"]) for s in set_docs), default=0),
+        "form_errors": form_errors,
+        "sets": set_docs,
+    }
 
 
-async def fetch_detail(
-    conn: asyncpg.Connection, workout_id: uuid.UUID, user_id: uuid.UUID
-) -> list[asyncpg.Record]:
-    return await conn.fetch(SELECT_WORKOUT_DETAIL, workout_id, user_id)
+async def get_existing_in_tx(tx, workout_id: uuid.UUID) -> ExistingWorkout | None:
+    snap = await registry_ref(workout_id).get(transaction=tx)
+    if not snap.exists:
+        return None
+    data = snap.to_dict()
+    return ExistingWorkout(user_id=uuid.UUID(data["user_id"]), content_hash=data["content_hash"])
+
+
+def insert_in_tx(tx, workout_id: uuid.UUID, user_id: uuid.UUID, document: dict) -> None:
+    """Kimlik kaydı + antrenman. İkisi de `create()`: transaction yarışı
+    kaybedilirse Firestore yeniden dener ve bu sefer kayıt görülür
+    (Postgres'teki `ON CONFLICT (id) DO NOTHING` yarış dalının karşılığı)."""
+    tx.create(
+        registry_ref(workout_id),
+        {"user_id": str(user_id), "content_hash": document["content_hash"], "created_at": firestore.SERVER_TIMESTAMP},
+    )
+    tx.create(workouts_col(user_id).document(str(workout_id)), {**document, "created_at": firestore.SERVER_TIMESTAMP})
+
+
+async def fetch_detail(workout_id: uuid.UUID, user_id: uuid.UUID) -> dict | None:
+    """Antrenmanın tamamı; başkasınınsa (kendi altında yok) `None`."""
+    snap = await workouts_col(user_id).document(str(workout_id)).get()
+    return snap.to_dict() if snap.exists else None
+
+
+def _to_summary(snap) -> WorkoutSummaryRow:
+    data = snap.to_dict()
+    return WorkoutSummaryRow(
+        id=uuid.UUID(snap.id),
+        exercise_id=data["exercise_id"],
+        started_at=data["started_at"],
+        ended_at=data.get("ended_at"),
+        total_sets=int(data.get("total_sets", 0)),
+        total_reps=int(data.get("total_reps", 0)),
+        reps_with_errors=int(data.get("reps_with_errors", 0)),
+        active_seconds=float(data.get("active_seconds", 0.0)),
+        best_set_reps=int(data.get("best_set_reps", 0)),
+        form_errors=dict(data.get("form_errors") or {}),
+    )
 
 
 async def fetch_page(
-    conn: asyncpg.Connection,
     user_id: uuid.UUID,
     *,
     cursor_started_at: datetime | None,
     cursor_id: uuid.UUID | None,
     limit: int,
 ) -> list[WorkoutSummaryRow]:
-    rows = await conn.fetch(
-        SELECT_WORKOUT_PAGE, user_id, cursor_started_at, cursor_id, limit
+    """En yeni üstte. `(started_at, id)` bileşik imleç — Postgres'teki
+    `(w.started_at, w.id) < ($2, $3)` karşılaştırmasının aynısı: aynı anda
+    başlamış iki antrenmanda bile kararlı sıra. `__name__` ikincil sıralaması
+    tek alanlı indeksin örtük sırası, bileşik indeks gerekmiyor."""
+    query = (
+        workouts_col(user_id)
+        .select(SUMMARY_FIELDS)
+        .order_by("started_at", direction=firestore.Query.DESCENDING)
+        .order_by(FieldPath.document_id(), direction=firestore.Query.DESCENDING)
     )
-    return [
-        WorkoutSummaryRow(
-            id=row["id"],
-            exercise_id=row["exercise_id"],
-            started_at=row["started_at"],
-            ended_at=row["ended_at"],
-            total_sets=row["total_sets"],
-            total_reps=row["total_reps"],
-            reps_with_errors=row["reps_with_errors"],
-            # `EXTRACT(EPOCH ...)` numeric doner, asyncpg Decimal'e cevirir.
-            active_seconds=float(row["active_seconds"]),
-            best_set_reps=row["best_set_reps"],
-        )
-        for row in rows
-    ]
+    if cursor_started_at is not None and cursor_id is not None:
+        query = query.start_after({"started_at": cursor_started_at, "__name__": str(cursor_id)})
+    return [_to_summary(snap) async for snap in query.limit(limit).stream()]
 
 
-async def delete_by_user(conn: asyncpg.Connection, user_id: uuid.UUID) -> int:
-    """Kullanicinin tum antrenmanlarini siler (hesap silme zinciri).
+async def fetch_between(user_id: uuid.UUID, start_utc: datetime, end_utc: datetime) -> list[WorkoutSummaryRow]:
+    """`[start, end)` yarım açık aralıktaki antrenmanların özetleri.
 
-    `sets`, `reps` ve `rep_form_errors` CASCADE ile birlikte gidiyor.
+    Plan tamamlanması ve günlük istatistiğin ortak kaynağı. Okuma maliyeti:
+    aralıktaki antrenman başına 1 doküman.
     """
-    result = await conn.execute(DELETE_BY_USER, user_id)
-    return int(result.rsplit(" ", 1)[1])
+    query = (
+        workouts_col(user_id)
+        .select(SUMMARY_FIELDS)
+        .where(filter=firestore.FieldFilter("started_at", ">=", start_utc))
+        .where(filter=firestore.FieldFilter("started_at", "<", end_utc))
+        .order_by("started_at")
+    )
+    return [_to_summary(snap) async for snap in query.stream()]

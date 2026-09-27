@@ -11,7 +11,6 @@ from datetime import date
 
 from fastapi import APIRouter, Header, Query
 
-from app.db import db
 from app.errors import unprocessable
 from app.identity import require_user_id
 from app.localday import check_offset, day_bounds, parse_date, range_bounds
@@ -62,9 +61,8 @@ async def get_plan(
     offset = check_offset(tz_offset)
     start, end = day_bounds(target_day, offset)
 
-    async with db.pool.acquire() as conn:
-        rows = await plan.fetch_day(conn, user_id, target_day)
-        done = await plan.done_reps(conn, user_id, start, end)
+    rows = await plan.fetch_day(user_id, target_day)
+    done = await plan.done_reps(user_id, start, end)
 
     items = _to_items(rows, done)
     return PlanDayOut(
@@ -88,22 +86,20 @@ async def put_plan(
     offset = check_offset(tz_offset)
     start, end = day_bounds(target_day, offset)
 
-    async with db.pool.acquire() as conn:
-        # Bilinmeyen egzersiz veritabanı foreign key'ine takılırdı ama oradan
-        # gelen hata 500 olurdu; burada hangi id'nin geçersiz olduğu söyleniyor.
-        for item in payload.items:
-            if not await exercises.exists(conn, item.exercise_id):
-                raise unprocessable(
-                    "Bilinmeyen egzersiz", {"exercise_id": item.exercise_id}
-                )
+    # Bilinmeyen egzersiz kataloğa karşı doğrulanıyor; hangi id'nin geçersiz
+    # olduğu söyleniyor.
+    for item in payload.items:
+        if not exercises.exists(item.exercise_id):
+            raise unprocessable(
+                "Bilinmeyen egzersiz", {"exercise_id": item.exercise_id}
+            )
 
-        # TEK TRANSACTION: silme başarılı olup ekleme patlarsa kullanıcının
-        # programı sessizce silinmiş olurdu.
-        async with conn.transaction():
-            await plan.replace_day(conn, user_id, target_day, payload.items)
+    # Günün tamamı TEK dokümanın tek yazımı — "silindi ama eklenmedi" ara
+    # durumu oluşamaz (Postgres'te bunun için transaction gerekiyordu).
+    await plan.replace_day(user_id, target_day, payload.items)
 
-        rows = await plan.fetch_day(conn, user_id, target_day)
-        done = await plan.done_reps(conn, user_id, start, end)
+    rows = await plan.fetch_day(user_id, target_day)
+    done = await plan.done_reps(user_id, start, end)
 
     logger.info(
         "program yazıldı user_id=%s gün=%s kalem=%d",
@@ -145,9 +141,8 @@ async def get_plan_range(
 
     start, end = range_bounds(first, last, offset)
 
-    async with db.pool.acquire() as conn:
-        rows = await plan.fetch_range(conn, user_id, first, last)
-        done_by_day = await plan.done_reps_by_day(conn, user_id, offset, start, end)
+    rows = await plan.fetch_range(user_id, first, last)
+    done_by_day = await plan.done_reps_by_day(user_id, offset, start, end)
 
     grouped: dict[date, list] = {}
     for row in rows:

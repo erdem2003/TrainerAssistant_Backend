@@ -18,6 +18,7 @@ from app.correlation import (
 )
 from app.db import db
 from app.errors import ApiError, api_error_handler, unhandled_error_handler
+from app.repo import outbox
 from app.routers import health, internal, plan, stats, workouts
 
 logger = logging.getLogger(__name__)
@@ -31,10 +32,16 @@ async def lifespan(_: FastAPI):
     # başlat" sırasını herkesin hatırlaması gerekirdi; unutulduğunda hata
     # veritabanı seviyesinde ve anlaşılmaz çıkar.
     await db.migrate()
+    # Kafka relay sürecinin yerini alan süreç içi dağıtıcı (ADR 0019 karar 2).
+    # Abonelerini (analytics, social) tek süreçli giriş noktası kaydeder.
+    dispatcher = outbox.dispatcher()
+    if settings.outbox_dispatcher_enabled:
+        dispatcher.start()
     logger.info("%s hazır", settings.service_name)
     try:
         yield
     finally:
+        await dispatcher.stop()
         await db.close()
 
 app = FastAPI(

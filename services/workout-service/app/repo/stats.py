@@ -1,23 +1,20 @@
-"""Gunluk toplamlar — Istatistik ekraninin tek veri kaynagi.
+"""Günlük toplamlar — İstatistik ekranının tek veri kaynağı.
 
-★ NEDEN BU UC VAR ★
-Istatistik ekrani gun bazinda kalori, tekrar, set ve form hatasi dagilimi
-gosteriyor. Bunlari gecmis listesinden turetmek MUMKUN degildi: liste yaniti
-tekrarlari ve hatalari tasimiyor (WorkoutSummary bilincli olarak sade), ayrintiya
-inmek icin antrenman basina bir istek gerekirdi — 30 gunluk bir ekran icin
-onlarca cagri.
+★ NEDEN BU UÇ VAR ★
+İstatistik ekranı gün bazında kalori, tekrar, set ve form hatası dağılımı
+gösteriyor. Bunları geçmiş listesinden türetmek MÜMKÜN değildi: liste yanıtı
+tekrarları ve hataları taşımıyor, ayrıntıya inmek için antrenman başına bir
+istek gerekirdi.
 
-★ BU MANTIK ILERIDE `analytics-service`'E TASINACAK ★
-ADR 0006 toplama isini oraya veriyor. Ucun BICIMI o zaman degismeyecek; yalnizca
-hesabin nerede yapildigi degisecek. Bu yuzden istemci bu ucu "gunluk toplamlar"
-olarak taniyor, "workout-service'in bir ozelligi" olarak degil.
+★ FIRESTORE KARŞILIĞI ★
+Postgres'teki CTE'ler (set_agg / rep_agg / workout_count / hata dağılımı) artık
+tek bir aralık sorgusunun üzerinde bellek içi toplama. Kartezyen tuzağı
+(set × tekrar × hata JOIN'inde `active_seconds`'ın şişmesi) burada tanım gereği
+yok: her antrenman dokümanı toplamlarını yazım anında hesaplanmış olarak taşıyor
+(`repo/workouts.build_document`). Okuma maliyeti: aralıktaki antrenman başına
+1 doküman; setler/tekrarlar `select()` ile çekilmiyor.
 
-★ KALORI BURADA HESAPLANMIYOR ★
-Yalnizca `active_seconds` donuyor. Kalori kilo ve MET gerektiriyor; kilo
-`user-service`'te ve MET egzersiz katalogunun bilgisi. Sunucu tarafinda kalori
-hesaplamak, bu servisi baska bir servisin verisine bagimli kilardi. Istemci
-`core/health/HealthMetrics` ile hesapliyor — ADR 0010'un "kalori saklanmaz,
-okunurken hesaplanir" karariyla ayni cizgi.
+★ KALORİ BURADA HESAPLANMIYOR ★ (ADR 0010) — yalnızca `active_seconds` döner.
 """
 
 from __future__ import annotations
@@ -26,81 +23,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
-import asyncpg
-
-# Gun etiketi `AT TIME ZONE 'UTC'` ile naif timestamp'e cevrilip sonra saat dilimi
-# farki eklenerek cikariliyor. Dogrudan `timestamptz::date` kullanmak Postgres'in
-# OTURUM saat dilimine baglanirdi ve o degistiginde gun etiketleri sessizce kayardi.
-_DAY_WORKOUT_CTE = """
-WITH day_workout AS (
-    SELECT w.id,
-           w.exercise_id,
-           (((w.started_at AT TIME ZONE 'UTC') + $2::interval))::date AS local_date
-      FROM workouts w
-     WHERE w.user_id = $1 AND w.started_at >= $3 AND w.started_at < $4
-)
-"""
-
-# ★ SET VE TEKRAR AYRI CTE'LERDE TOPLANIYOR ★
-# Tek sorguda set × tekrar × hata JOIN'i yapilsaydi set sureleri her tekrar icin
-# bir kez daha toplanir ve `active_seconds` kat kat sisirilirdi. Ayni tuzak
-# `SELECT_WORKOUT_PAGE`'de `COUNT(DISTINCT ...)` ile cozulmus; toplama (SUM)
-# icin DISTINCT bir cozum degil, granulariteyi ayirmak gerekiyor.
-SELECT_DAILY = _DAY_WORKOUT_CTE + """
-, set_agg AS (
-    SELECT dw.local_date,
-           dw.exercise_id,
-           COUNT(s.id) AS sets,
-           COALESCE(SUM(EXTRACT(EPOCH FROM (s.ended_at - s.started_at))), 0) AS active_seconds
-      FROM day_workout dw
-      LEFT JOIN sets s ON s.workout_id = dw.id
-     GROUP BY dw.local_date, dw.exercise_id
-),
-rep_agg AS (
-    SELECT dw.local_date,
-           dw.exercise_id,
-           COUNT(r.id) AS reps,
-           COUNT(r.id) FILTER (WHERE faulty.rep_id IS NOT NULL) AS reps_with_errors
-      FROM day_workout dw
-      JOIN sets s ON s.workout_id = dw.id
-      JOIN reps r ON r.set_id = s.id
-      -- Tekrar basina EN FAZLA BIR satir: bir tekrarda iki hata varsa
-      -- `reps_with_errors` iki kez saymamali.
-      LEFT JOIN (SELECT DISTINCT rep_id FROM rep_form_errors) faulty
-             ON faulty.rep_id = r.id
-     GROUP BY dw.local_date, dw.exercise_id
-),
-workout_count AS (
-    SELECT local_date, COUNT(*) AS workouts
-      FROM day_workout
-     GROUP BY local_date
-)
-SELECT sa.local_date,
-       sa.exercise_id,
-       sa.sets,
-       sa.active_seconds,
-       COALESCE(ra.reps, 0)             AS reps,
-       COALESCE(ra.reps_with_errors, 0) AS reps_with_errors,
-       wc.workouts
-  FROM set_agg sa
-  LEFT JOIN rep_agg ra
-         ON ra.local_date = sa.local_date AND ra.exercise_id = sa.exercise_id
-  JOIN workout_count wc ON wc.local_date = sa.local_date
- ORDER BY sa.local_date, sa.exercise_id
-"""
-
-# Form hatasi dagilimi — gun ve hata turune gore.
-# Ayri sorgu, cunku ayni sonuc kumesine sigdirmak hata turu basina bir sutun ya da
-# JSON toplama gerektirirdi; ikisi de okunmasi zor SQL uretiyor.
-SELECT_DAILY_ERRORS = _DAY_WORKOUT_CTE + """
-SELECT dw.local_date, e.error, COUNT(*) AS occurrences
-  FROM day_workout dw
-  JOIN sets s ON s.workout_id = dw.id
-  JOIN reps r ON r.set_id = s.id
-  JOIN rep_form_errors e ON e.rep_id = r.id
- GROUP BY dw.local_date, e.error
- ORDER BY dw.local_date, e.error
-"""
+from app.repo import workouts
 
 
 @dataclass(frozen=True)
@@ -122,56 +45,46 @@ class ErrorDayRow:
 
 
 async def fetch_daily(
-    conn: asyncpg.Connection,
     user_id: uuid.UUID,
     offset_minutes: int,
     start_utc: datetime,
     end_utc: datetime,
-) -> list[ExerciseDayRow]:
-    """Gun × egzersiz kiriliminda toplamlar."""
-    rows = await conn.fetch(
-        SELECT_DAILY,
-        user_id,
-        timedelta(minutes=offset_minutes),
-        start_utc,
-        end_utc,
-    )
-    return [
+) -> tuple[list[ExerciseDayRow], list[ErrorDayRow]]:
+    """Gün × egzersiz toplamları VE gün × form hatası dağılımı — tek sorgudan.
+
+    Postgres'te iki ayrı sorguydu; burada ikisini ayrı çekmek aynı dokümanları
+    iki kez okumak (iki kat kota) olurdu.
+    """
+    offset = timedelta(minutes=offset_minutes)
+    per_ex: dict[tuple[date, str], dict] = {}
+    workouts_per_day: dict[date, int] = {}
+    errors: dict[tuple[date, str], int] = {}
+
+    for w in await workouts.fetch_between(user_id, start_utc, end_utc):
+        day = (w.started_at + offset).date()
+        workouts_per_day[day] = workouts_per_day.get(day, 0) + 1
+        agg = per_ex.setdefault((day, w.exercise_id), {"sets": 0, "reps": 0, "rwe": 0, "active": 0.0})
+        agg["sets"] += w.total_sets
+        agg["reps"] += w.total_reps
+        agg["rwe"] += w.reps_with_errors
+        agg["active"] += w.active_seconds
+        for error, count in w.form_errors.items():
+            errors[(day, error)] = errors.get((day, error), 0) + int(count)
+
+    rows = [
         ExerciseDayRow(
-            local_date=row["local_date"],
-            exercise_id=row["exercise_id"],
-            sets=row["sets"],
-            reps=row["reps"],
-            reps_with_errors=row["reps_with_errors"],
-            # `EXTRACT(EPOCH ...)` numeric doner, asyncpg Decimal'e cevirir.
-            # JSON'a Decimal yazmak istemedigimiz icin burada float'a duruyor.
-            active_seconds=float(row["active_seconds"]),
-            workouts=row["workouts"],
+            local_date=day,
+            exercise_id=exercise_id,
+            sets=agg["sets"],
+            reps=agg["reps"],
+            reps_with_errors=agg["rwe"],
+            active_seconds=float(agg["active"]),
+            workouts=workouts_per_day[day],
         )
-        for row in rows
+        for (day, exercise_id), agg in sorted(per_ex.items())
     ]
-
-
-async def fetch_daily_errors(
-    conn: asyncpg.Connection,
-    user_id: uuid.UUID,
-    offset_minutes: int,
-    start_utc: datetime,
-    end_utc: datetime,
-) -> list[ErrorDayRow]:
-    """Gun × form hatasi kiriliminda tekrar sayilari."""
-    rows = await conn.fetch(
-        SELECT_DAILY_ERRORS,
-        user_id,
-        timedelta(minutes=offset_minutes),
-        start_utc,
-        end_utc,
-    )
-    return [
-        ErrorDayRow(
-            local_date=row["local_date"],
-            error=row["error"],
-            occurrences=row["occurrences"],
-        )
-        for row in rows
+    error_rows = [
+        ErrorDayRow(local_date=day, error=error, occurrences=count)
+        for (day, error), count in sorted(errors.items())
     ]
+    return rows, error_rows
