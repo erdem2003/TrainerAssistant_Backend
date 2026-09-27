@@ -23,7 +23,6 @@ from fastapi import APIRouter, Header, Query
 from pydantic import BaseModel
 
 from app.badges import evaluate as evaluate_badges
-from app.db import db
 from app.errors import unprocessable
 from app.identity import require_user_id
 from app.localday import check_offset, parse_date, range_bounds
@@ -78,8 +77,7 @@ async def get_daily(
 
     start, end = range_bounds(first, last, offset)
 
-    async with db.pool.acquire() as conn:
-        rows = await facts.fetch_daily(conn, user_id, offset, start, end)
+    rows = await facts.fetch_daily(user_id, offset, start, end)
 
     by_day: dict[str, list] = {}
     workouts_by_day: dict[str, int] = {}
@@ -152,10 +150,9 @@ async def get_error_distribution(
 
     start, end = range_bounds(first, last, offset)
 
-    async with db.pool.acquire() as conn:
-        rows, total_reps, reps_with_errors = await facts.fetch_error_counts(
-            conn, user_id, start, end, exercise
-        )
+    rows, total_reps, reps_with_errors = await facts.fetch_error_counts(
+        user_id, start, end, exercise
+    )
 
     return ErrorDistributionOut(
         total_reps=total_reps,
@@ -195,8 +192,7 @@ async def get_badges(
     user_id = require_user_id(x_user_id)
     offset = check_offset(tz_offset)
 
-    async with db.pool.acquire() as conn:
-        stats = await facts.fetch_badge_stats(conn, user_id, offset)
+    stats = await facts.fetch_badge_stats(user_id, offset)
 
     today_local = (
         datetime.now(timezone.utc) + timedelta(minutes=offset)

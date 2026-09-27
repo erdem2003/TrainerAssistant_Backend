@@ -19,6 +19,7 @@ from app.correlation import (
 from app.db import db
 from app.errors import ApiError, api_error_handler, unhandled_error_handler
 from app.routers import analytics, health, internal
+from app.worker import consumer
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +32,14 @@ async def lifespan(_: FastAPI):
     # başlat" sırasını herkesin hatırlaması gerekirdi; unutulduğunda hata
     # veritabanı seviyesinde ve anlaşılmaz çıkar.
     await db.migrate()
+    # Ayrı Kafka tüketici süreci yerine süreç içi dağıtıcıya abonelik
+    # (ADR 0019 karar 2). Dağıtıcıyı workout-service başlatıyor.
+    consumer.register()
     logger.info("%s hazır", settings.service_name)
     try:
         yield
     finally:
+        consumer.unregister()
         await db.close()
 
 app = FastAPI(

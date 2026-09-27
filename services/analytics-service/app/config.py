@@ -19,17 +19,16 @@ class Settings(BaseSettings):
 
     internal_api_key: str = ""
 
-    # --- Kafka --------------------------------------------------------------
-    kafka_bootstrap: str = "redpanda:9092"
-
+    # --- Olay akisi (ADR 0019: Kafka yerine Firestore outbox dagiticisi) -----
     # Topic adi `workout-service/app/events.py`'deki sabitle AYNI olmali.
     # Iki yerde duruyor cunku servisler kod paylasmiyor (ADR 0005); degisirse
     # ikisi birden degismeli.
     topic_workout_session: str = "workout.session"
 
     # ★ CONSUMER GROUP ADI ★
-    # Offset bu ada bagli. Replay'in bir yolu offset'i sifirlamak, digeri bu adi
-    # degistirmek — yeni bir group akisi bastan okur.
+    # Dagitici teslim durumunu (`delivered`) bu adla tutuyor. Replay'in bir yolu
+    # `dispatcher.replay(group=...)`, digeri bu adi degistirmek — yeni grup
+    # olaylari yalnizca replay ile gorur (Kafka'daki `earliest` yerine).
     consumer_group: str = "analytics-workout-v1"
 
     # ★ REPLAY MODU ★
@@ -37,9 +36,6 @@ class Settings(BaseSettings):
     # yutmak isteniyor, replay'de ise tam tersi — her olay guncel mantikla
     # yeniden islenmeli.
     replay_mode: bool = False
-
-    # Yazma hatasindan sonra beklenen sure; kuyrugu bosuna dondurmemek icin.
-    retry_seconds: float = 2.0
 
 
 @lru_cache
