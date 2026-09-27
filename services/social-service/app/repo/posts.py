@@ -1,167 +1,48 @@
-"""posts / post_likes / post_comments SQL (ADR 0014, Faz S4).
+"""Gönderi / beğeni / yorum (ADR 0014 Faz S4, 0016, 0017).
 
-Beğeni/yorum SAYISI hiçbir yerde saklanmıyor (ADR 0012) — feed ve yorum
-sayısı sorgu anında `COUNT()` ile hesaplanıyor.
+★ SAYAÇ YOK ★ Beğeni ve yorum SAYISI hiçbir yerde saklanmıyor — Postgres'teki
+`COUNT()`-anında ilkesi korunuyor: Firestore `count()` toplamasıyla okuma anında
+sayılıyor (1000 girdiye kadar 1 okuma). Bedeli: feed sayfası başına gönderi
+başına ~3 okuma (beğeni sayısı, yorum sayısı, "ben beğendim mi"). Sayaç alanı
+okumaları azaltırdı ama "saklanmaz, türetilir" kararını değiştirmek bu portun
+kapsamı dışında — açık soru olarak raporlandı.
+
+★ DURUM MAKİNESİ ★ PENDING_SNAPSHOT → VISIBLE aynen duruyor. Durumla birlikte
+yalnızca-o-durumda-var alanlar taşınıyor: `pending_since` (süpürücü için),
+`feed_at` (feed sıralaması için) — ikisi de tek alanlı indeksle sorgulanıyor
+(gerekçe `app/db.py`).
+
+Satır şekli: `fetch_feed`/`fetch_one` Postgres sorgusunun döndürdüğü sütun
+adlarının AYNISIYLA sözlük döndürüyor ki router'daki `_post_out_from_row` tek
+haritalayıcı olarak kalsın.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-import asyncpg
+from google.api_core.exceptions import AlreadyExists
+from google.cloud import firestore
+from google.cloud.firestore_v1.field_path import FieldPath
 
-_INSERT_POST = """
-INSERT INTO posts (id, author_id, workout_id, note, status, post_type, photo_content_type)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-"""
+from app.db import db
+from app.repo import profiles, snapshots
 
-_FIND_POST_BY_ID = """
-SELECT id, author_id, workout_id, note, status, created_at, post_type, photo_content_type
-  FROM posts WHERE id = $1
-"""
+# Snapshot'ı gelmeyen gönderinin ömrü (Postgres'teki `interval '15 minutes'`).
+PENDING_TTL = timedelta(minutes=15)
 
-# Snapshot ZATEN varsa ve yazara aitse hızlı yol: gönderi hemen VISIBLE.
-# Snapshot başkasınaysa (uydurma workout_id) ya da hiç yoksa çağıran taraf
-# (router) PENDING_SNAPSHOT ile devam eder — ikinci durumda tüketici
-# (workout_consumer.promote_pending) ya da süpürücü sonucu belirler.
-_FIND_SNAPSHOT_OWNER = "SELECT user_id FROM workout_snapshots WHERE workout_id = $1"
 
-# ★ TERFİ ★ `workout_consumer.py`, her snapshot upsert'inden SONRA çağırır.
-# `author_id` eşleşmesi ZORUNLU: başkasının workout_id'siyle açılan bir
-# gönderi asla VISIBLE olamaz (ADR 0014 karar #2'nin doğal sonucu).
-_PROMOTE_PENDING = """
-UPDATE posts SET status = 'VISIBLE'
- WHERE workout_id = $1 AND author_id = $2 AND status = 'PENDING_SNAPSHOT'
-RETURNING id
-"""
+class WorkoutNotFound(Exception):
+    """Başkasının workout_id'si — hiç var olmamış gibi davranılır (404)."""
 
-_DELETE_STALE_PENDING = """
-DELETE FROM posts
- WHERE status = 'PENDING_SNAPSHOT' AND created_at < now() - interval '15 minutes'
-RETURNING id
-"""
 
-_DELETE_POST = "DELETE FROM posts WHERE id = $1 AND author_id = $2 RETURNING id"
-
-_SELECT_PHOTO_POST_IDS_BY_AUTHOR = """
-SELECT id FROM posts WHERE author_id = $1 AND photo_content_type IS NOT NULL
-"""
-
-_DELETE_POSTS_BY_AUTHOR = "DELETE FROM posts WHERE author_id = $1"
-_DELETE_LIKES_BY_USER = "DELETE FROM post_likes WHERE user_id = $1"
-_DELETE_COMMENTS_BY_AUTHOR = "DELETE FROM post_comments WHERE author_id = $1"
-
-# ★ FEED — HERKESE AÇIK (ADR 0017) ★ Yalnızca VISIBLE, sosyali açık HERKESİN
-# gönderisi — arkadaşlık filtresi YOK. Sahibin ilk isteği ("Twitter tarzı")
-# başta yalnızca gönderi TÜRÜNE (metin+foto) uygulanmıştı, görünürlük ADR
-# 0014 karar #3'ün "yalnızca arkadaşlar" mirasını taşımaya devam ediyordu —
-# sahip cihazda test ederken bunu fark edip düzeltilmesini istedi, ADR 0017
-# ile görünürlük de herkese açığa çevrildi. İmleçli sayfalama (created_at,
-# id) — service-contract §5. Beğeni/yorum sayısı ve "ben beğendim mi" tek
-# sorguda LEFT JOIN + agregasyonla çıkarılıyor.
-# ★ LEFT JOIN workout_snapshots ★ (ADR 0016, önceden JOIN idi) — MOTIVATION
-# gönderisinin workout_id'si hiç yok, iç JOIN olsaydı o satır feed'den
-# tamamen düşerdi. WORKOUT gönderileri için davranış DEĞİŞMEDİ: snapshot her
-# zaman var (posts_type_shape_chk zorunlu kılıyor), LEFT JOIN yine tam eşleşir.
-_SELECT_FEED = """
-SELECT p.id, p.author_id, p.workout_id, p.note, p.created_at, p.post_type,
-       (p.photo_content_type IS NOT NULL) AS has_photo,
-       s.exercise_id, s.total_sets, s.total_reps, s.reps_with_errors, s.best_set_reps,
-       pr.username AS author_username, pr.display_name AS author_display_name,
-       pr.avatar_seed AS author_avatar_seed,
-       COUNT(DISTINCT l.user_id) AS like_count,
-       COUNT(DISTINCT c.id) AS comment_count,
-       COALESCE(BOOL_OR(l.user_id = $1), false) AS liked_by_me,
-       (sc.post_id IS NOT NULL) AS has_clip
-  FROM posts p
-  LEFT JOIN workout_snapshots s ON s.workout_id = p.workout_id
-  JOIN social_profiles pr ON pr.user_id = p.author_id
-  LEFT JOIN post_likes l ON l.post_id = p.id
-  LEFT JOIN post_comments c ON c.post_id = p.id
-  LEFT JOIN shared_clips sc ON sc.post_id = p.id
- WHERE p.status = 'VISIBLE'
-   AND (p.created_at, p.id) < ($2, $3)
- GROUP BY p.id, s.exercise_id, s.total_sets, s.total_reps, s.reps_with_errors,
-          s.best_set_reps, pr.username, pr.display_name, pr.avatar_seed, sc.post_id
- ORDER BY p.created_at DESC, p.id DESC
- LIMIT $4
-"""
-
-# Tek gönderiyi feed satırıyla AYNI ŞEKİLDE döndürür — motivasyon gönderisi
-# oluşturulunca (ya da idempotent tekrar gönderilince) ikinci bir farklı
-# alan haritalamasına düşmemek için `app/routers/posts.py` ikisinde de aynı
-# `_post_out_from_row` haritalayıcısını kullanıyor.
-_SELECT_ONE = """
-SELECT p.id, p.author_id, p.workout_id, p.note, p.created_at, p.post_type,
-       (p.photo_content_type IS NOT NULL) AS has_photo,
-       s.exercise_id, s.total_sets, s.total_reps, s.reps_with_errors, s.best_set_reps,
-       pr.username AS author_username, pr.display_name AS author_display_name,
-       pr.avatar_seed AS author_avatar_seed,
-       COUNT(DISTINCT l.user_id) AS like_count,
-       COUNT(DISTINCT c.id) AS comment_count,
-       COALESCE(BOOL_OR(l.user_id = $1), false) AS liked_by_me,
-       (sc.post_id IS NOT NULL) AS has_clip
-  FROM posts p
-  LEFT JOIN workout_snapshots s ON s.workout_id = p.workout_id
-  JOIN social_profiles pr ON pr.user_id = p.author_id
-  LEFT JOIN post_likes l ON l.post_id = p.id
-  LEFT JOIN post_comments c ON c.post_id = p.id
-  LEFT JOIN shared_clips sc ON sc.post_id = p.id
- WHERE p.id = $2
- GROUP BY p.id, s.exercise_id, s.total_sets, s.total_reps, s.reps_with_errors,
-          s.best_set_reps, pr.username, pr.display_name, pr.avatar_seed, sc.post_id
-"""
-
-_UPSERT_LIKE = """
-INSERT INTO post_likes (post_id, user_id) VALUES ($1, $2)
-ON CONFLICT (post_id, user_id) DO NOTHING
-"""
-
-_DELETE_LIKE = "DELETE FROM post_likes WHERE post_id = $1 AND user_id = $2"
-
-_INSERT_COMMENT = """
-INSERT INTO post_comments (id, post_id, author_id, body, parent_comment_id)
-VALUES ($1, $2, $3, $4, $5)
-"""
-
-_FIND_COMMENT_BY_ID = """
-SELECT id, post_id, author_id, body, created_at, parent_comment_id FROM post_comments WHERE id = $1
-"""
-
-# ★ YALNIZCA ÜST SEVİYE ★ (Faz S13 — "yoruma yorum") `parent_comment_id IS
-# NULL`: yanıtlar burada değil, `_SELECT_REPLIES`'te. `reply_count` her
-# yorumun kaç yanıtı olduğunu tek sorguda taşıyor — istemci "3 yanıt" yazıp
-# dokunulunca `_SELECT_REPLIES`'i çağırıyor, her yorum için ayrı bir sayım
-# isteği atmıyor.
-_SELECT_COMMENTS = """
-SELECT c.id, c.post_id, c.author_id, c.body, c.created_at, c.parent_comment_id,
-       pr.username, pr.display_name, pr.avatar_seed,
-       COUNT(r.id) AS reply_count
-  FROM post_comments c
-  JOIN social_profiles pr ON pr.user_id = c.author_id
-  LEFT JOIN post_comments r ON r.parent_comment_id = c.id
- WHERE c.post_id = $1 AND c.parent_comment_id IS NULL AND (c.created_at, c.id) > ($2, $3)
- GROUP BY c.id, pr.username, pr.display_name, pr.avatar_seed
- ORDER BY c.created_at, c.id
- LIMIT $4
-"""
-
-# Bir üst yorumun yanıtları — TEK SEVİYE olduğu için `reply_count` yok,
-# sayfalama da yok (bir yorumun yanıtı gerçek kullanımda birkaç düzine
-# geçmiyor; geçerse `service-contract` §5 desenine göre eklenir).
-_SELECT_REPLIES = """
-SELECT c.id, c.post_id, c.author_id, c.body, c.created_at, c.parent_comment_id,
-       pr.username, pr.display_name, pr.avatar_seed
-  FROM post_comments c
-  JOIN social_profiles pr ON pr.user_id = c.author_id
- WHERE c.parent_comment_id = $1
- ORDER BY c.created_at, c.id
- LIMIT 200
-"""
+class AlreadyShared(Exception):
+    """(author_id, workout_id) UNIQUE — bu antrenman zaten paylaşılmış."""
 
 
 @dataclass(frozen=True)
@@ -174,6 +55,38 @@ class Post:
     created_at: datetime
     post_type: str
     photo_content_type: str | None
+    has_clip: bool = False
+
+
+def _posts():
+    return db.collection("posts")
+
+
+def _likes():
+    return db.collection("post_likes")
+
+
+def _comments():
+    return db.collection("post_comments")
+
+
+def _lock(author_id: uuid.UUID, workout_id: uuid.UUID):
+    return db.collection("workout_posts").document(f"{author_id}_{workout_id}")
+
+
+def _to_post(snap) -> Post:
+    d = snap.to_dict()
+    return Post(
+        id=uuid.UUID(snap.id),
+        author_id=uuid.UUID(d["author_id"]),
+        workout_id=uuid.UUID(d["workout_id"]) if d.get("workout_id") else None,
+        note=d.get("note", ""),
+        status=d["status"],
+        created_at=d["created_at"],
+        post_type=d.get("post_type", "WORKOUT"),
+        photo_content_type=d.get("photo_content_type"),
+        has_clip=bool(d.get("has_clip")),
+    )
 
 
 def encode_cursor(created_at: datetime, item_id: uuid.UUID) -> str:
@@ -181,10 +94,9 @@ def encode_cursor(created_at: datetime, item_id: uuid.UUID) -> str:
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
 
 
-def decode_cursor(cursor: str | None) -> tuple[datetime, uuid.UUID]:
+def decode_cursor(cursor: str | None) -> tuple[datetime, uuid.UUID] | None:
     if cursor is None:
-        # En yeni tarihten ileri hiçbir şey yok, sayfalama en baştan başlar.
-        return (datetime.now(tz=timezone.utc), uuid.UUID(int=(2**128 - 1)))
+        return None
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
         raw = base64.urlsafe_b64decode(padded).decode()
@@ -197,111 +109,339 @@ def decode_cursor(cursor: str | None) -> tuple[datetime, uuid.UUID]:
         raise ValueError("geçersiz imleç") from None
 
 
-async def find_snapshot_owner(conn: asyncpg.Connection, workout_id: uuid.UUID) -> uuid.UUID | None:
-    row = await conn.fetchrow(_FIND_SNAPSHOT_OWNER, workout_id)
-    return row["user_id"] if row else None
+# --- Oluşturma -----------------------------------------------------------------
 
 
-async def create(
-    conn: asyncpg.Connection,
-    *,
-    post_id: uuid.UUID,
-    author_id: uuid.UUID,
-    workout_id: uuid.UUID | None,
-    note: str,
-    status: str,
-    post_type: str = "WORKOUT",
-    photo_content_type: str | None = None,
-) -> None:
-    await conn.execute(
-        _INSERT_POST, post_id, author_id, workout_id, note, status, post_type, photo_content_type
+async def find_by_id(post_id: uuid.UUID) -> Post | None:
+    snap = await _posts().document(str(post_id)).get()
+    return _to_post(snap) if snap.exists else None
+
+
+async def create_workout_post(
+    *, post_id: uuid.UUID, author_id: uuid.UUID, workout_id: uuid.UUID, note: str
+) -> tuple[Post | None, str]:
+    """(mevcut gönderi | None, durum). Mevcutsa hiçbir şey yazılmaz.
+
+    Tek transaction: idempotency (aynı id), (yazar, antrenman) tekliği,
+    sahiplik kontrolü ve hızlı yol (snapshot zaten varsa hemen VISIBLE).
+    """
+    post_ref = _posts().document(str(post_id))
+    lock_ref = _lock(author_id, workout_id)
+    now = datetime.now(timezone.utc)
+
+    @firestore.async_transactional
+    async def run(tx):
+        existing = await post_ref.get(transaction=tx)
+        if existing.exists:
+            return _to_post(existing), existing.get("status")
+        lock = await lock_ref.get(transaction=tx)
+        owner_snap = await snapshots.owner_ref(workout_id).get(transaction=tx)
+        if lock.exists:
+            raise AlreadyShared(str(workout_id))
+        owner = uuid.UUID(owner_snap.get("user_id")) if owner_snap.exists else None
+        if owner is not None and owner != author_id:
+            raise WorkoutNotFound(str(workout_id))
+        status = "VISIBLE" if owner == author_id else "PENDING_SNAPSHOT"
+        data = {
+            "author_id": str(author_id),
+            "workout_id": str(workout_id),
+            "note": note,
+            "status": status,
+            "post_type": "WORKOUT",
+            "photo_content_type": None,
+            "has_clip": False,
+            "created_at": now,
+        }
+        data["feed_at" if status == "VISIBLE" else "pending_since"] = now
+        tx.create(post_ref, data)
+        tx.create(lock_ref, {"post_id": str(post_id)})
+        return None, status
+
+    return await run(db.client.transaction())
+
+
+async def create_motivation_post(
+    *, post_id: uuid.UUID, author_id: uuid.UUID, note: str, photo_content_type: str | None
+) -> Post | None:
+    """Mevcutsa onu döner (idempotent tekrar); değilse VISIBLE oluşturur ve None."""
+    now = datetime.now(timezone.utc)
+    try:
+        await _posts().document(str(post_id)).create({
+            "author_id": str(author_id),
+            "workout_id": None,
+            "note": note,
+            "status": "VISIBLE",
+            "post_type": "MOTIVATION",
+            "photo_content_type": photo_content_type,
+            "has_clip": False,
+            "created_at": now,
+            "feed_at": now,
+        })
+        return None
+    except AlreadyExists:
+        return await find_by_id(post_id)
+
+
+# --- Terfi / süpürme (tüketici) -------------------------------------------------
+
+
+async def read_pending_in_tx(tx, workout_id: uuid.UUID, author_id: uuid.UUID):
+    """Tüketici transaction'ının OKUMA yarısı: bu (yazar, antrenman) için
+    bekleyen gönderi varsa onun snapshot'ı."""
+    lock = await _lock(author_id, workout_id).get(transaction=tx)
+    if not lock.exists:
+        return None
+    post = await _posts().document(lock.get("post_id")).get(transaction=tx)
+    if not post.exists or post.get("status") != "PENDING_SNAPSHOT":
+        return None
+    return post
+
+
+def promote_in_tx(tx, post_snap) -> None:
+    """★ TERFİ ★ `author_id` eşleşmesi kilidin kimliğinde zaten var: başkasının
+    workout_id'siyle açılmış bir gönderi asla VISIBLE olamaz."""
+    tx.update(post_snap.reference, {
+        "status": "VISIBLE",
+        "feed_at": post_snap.get("created_at"),
+        "pending_since": firestore.DELETE_FIELD,
+    })
+
+
+async def sweep_stale_pending() -> int:
+    """15 dakikadır PENDING_SNAPSHOT kalan gönderileri siler."""
+    cutoff = datetime.now(timezone.utc) - PENDING_TTL
+    query = _posts().where(filter=firestore.FieldFilter("pending_since", "<", cutoff)).order_by("pending_since")
+    count = 0
+    async for snap in query.stream():
+        post = _to_post(snap)
+        await delete_cascade(post)
+        count += 1
+    return count
+
+
+# --- Silme ---------------------------------------------------------------------
+
+
+async def delete_cascade(post: Post) -> None:
+    """Gönderi + beğenileri + yorumları + klibi + kilidi (Postgres'teki
+    `ON DELETE CASCADE`). Önce gönderi: görünmez olur; kalan adımlar yarıda
+    kalsa bile sahipsiz beğeni/yorum hiçbir okuma yolunda görünmüyor."""
+    await _posts().document(str(post.id)).delete()
+    for col in (_likes(), _comments()):
+        async for snap in col.where(filter=firestore.FieldFilter("post_id", "==", str(post.id))).stream():
+            await snap.reference.delete()
+    await db.collection("clips").document(str(post.id)).delete()
+    if post.workout_id is not None:
+        await _lock(post.author_id, post.workout_id).delete()
+
+
+async def delete(post_id: uuid.UUID, author_id: uuid.UUID) -> Post | None:
+    """Yalnızca yazar silebilir; silinen gönderiyi döner (fotoğraf temizliği için)."""
+    post = await find_by_id(post_id)
+    if post is None or post.author_id != author_id:
+        return None
+    await delete_cascade(post)
+    return post
+
+
+async def delete_all_for_user(user_id: uuid.UUID) -> list[Post]:
+    """Hesap silme: kendi gönderileri (kaskadla), başkalarının gönderisine
+    bıraktığı beğeni/yorum ve o yorumlara gelen yanıtlar (Postgres'teki
+    `parent_comment_id ... ON DELETE CASCADE`). Silinen gönderileri döner."""
+    uid = str(user_id)
+    deleted: list[Post] = []
+    async for snap in _posts().where(filter=firestore.FieldFilter("author_id", "==", uid)).stream():
+        post = _to_post(snap)
+        await delete_cascade(post)
+        deleted.append(post)
+    async for snap in _likes().where(filter=firestore.FieldFilter("user_id", "==", uid)).stream():
+        await snap.reference.delete()
+    async for snap in _comments().where(filter=firestore.FieldFilter("author_id", "==", uid)).stream():
+        replies = _comments().where(filter=firestore.FieldFilter("parent_comment_id", "==", snap.id))
+        async for reply in replies.stream():
+            await reply.reference.delete()
+        await snap.reference.delete()
+    return deleted
+
+
+# --- Okuma: feed ----------------------------------------------------------------
+
+
+async def _count(query) -> int:
+    result = await query.count().get()
+    return int(result[0][0].value)
+
+
+async def _hydrate(viewer_id: uuid.UUID, posts: list[Post]) -> list[dict]:
+    """Postgres'teki JOIN'lerin karşılığı: yazar profili (INNER — profili
+    olmayan gönderi düşer), snapshot (LEFT), beğeni/yorum sayısı, "ben beğendim".
+    Hepsi toplu ya da paralel okunuyor."""
+    if not posts:
+        return []
+    authors = await profiles.profiles_map(p.author_id for p in posts)
+    snap_refs = [snapshots.snapshot_ref(p.author_id, p.workout_id) for p in posts if p.workout_id]
+    snaps = {}
+    if snap_refs:
+        async for s in db.client.get_all(snap_refs):
+            if s.exists:
+                snaps[s.id] = s.to_dict()
+    like_refs = [_likes().document(f"{p.id}_{viewer_id}") for p in posts]
+    liked = {s.id async for s in db.client.get_all(like_refs) if s.exists}
+    like_counts, comment_counts = await asyncio.gather(
+        asyncio.gather(*(_count(_likes().where(filter=firestore.FieldFilter("post_id", "==", str(p.id)))) for p in posts)),
+        asyncio.gather(*(_count(_comments().where(filter=firestore.FieldFilter("post_id", "==", str(p.id)))) for p in posts)),
+    )
+
+    rows = []
+    for post, like_count, comment_count in zip(posts, like_counts, comment_counts):
+        author = authors.get(post.author_id)
+        if author is None:
+            continue
+        snap = snaps.get(str(post.workout_id)) if post.workout_id else None
+        rows.append({
+            "id": post.id,
+            "author_id": post.author_id,
+            "workout_id": post.workout_id,
+            "note": post.note,
+            "created_at": post.created_at,
+            "post_type": post.post_type,
+            "has_photo": post.photo_content_type is not None,
+            "exercise_id": snap.get("exercise_id") if snap else None,
+            "total_sets": snap.get("total_sets") if snap else None,
+            "total_reps": snap.get("total_reps") if snap else None,
+            "reps_with_errors": snap.get("reps_with_errors") if snap else None,
+            "best_set_reps": snap.get("best_set_reps") if snap else None,
+            "author_username": author.username,
+            "author_display_name": author.display_name,
+            "author_avatar_seed": author.avatar_seed,
+            "like_count": like_count,
+            "comment_count": comment_count,
+            "liked_by_me": f"{post.id}_{viewer_id}" in liked,
+            "has_clip": post.has_clip,
+        })
+    return rows
+
+
+async def fetch_feed(viewer_id: uuid.UUID, cursor: str | None, limit: int) -> list[dict]:
+    """★ FEED — HERKESE AÇIK (ADR 0017) ★ Yalnızca VISIBLE (yani `feed_at`
+    taşıyan) gönderiler, `(created_at, id)` imleçli, en yeni üstte."""
+    query = (
+        _posts()
+        .order_by("feed_at", direction=firestore.Query.DESCENDING)
+        .order_by(FieldPath.document_id(), direction=firestore.Query.DESCENDING)
+    )
+    decoded = decode_cursor(cursor)
+    if decoded is not None:
+        query = query.start_after({"feed_at": decoded[0], "__name__": str(decoded[1])})
+    posts = [_to_post(s) async for s in query.limit(limit).stream()]
+    return await _hydrate(viewer_id, posts)
+
+
+async def fetch_one(viewer_id: uuid.UUID, post_id: uuid.UUID) -> dict | None:
+    post = await find_by_id(post_id)
+    if post is None:
+        return None
+    rows = await _hydrate(viewer_id, [post])
+    return rows[0] if rows else None
+
+
+# --- Beğeni ---------------------------------------------------------------------
+
+
+async def like(post_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    """`set()` — ikinci beğeni aynı dokümanı yazar (ON CONFLICT DO NOTHING)."""
+    await _likes().document(f"{post_id}_{user_id}").set(
+        {"post_id": str(post_id), "user_id": str(user_id), "created_at": firestore.SERVER_TIMESTAMP}
     )
 
 
-async def find_by_id(conn: asyncpg.Connection, post_id: uuid.UUID) -> Post | None:
-    row = await conn.fetchrow(_FIND_POST_BY_ID, post_id)
-    return Post(**dict(row)) if row else None
+async def unlike(post_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    await _likes().document(f"{post_id}_{user_id}").delete()
 
 
-async def fetch_one(conn: asyncpg.Connection, viewer_id: uuid.UUID, post_id: uuid.UUID) -> asyncpg.Record | None:
-    """`_SELECT_FEED` ile AYNI alan haritası — motivasyon gönderisi oluşturunca
-    `PostOut`'u ikinci bir farklı sorguyla değil, feed'in kullandığı haritalayıcının
-    beklediği aynı satır şekliyle döndürmek için."""
-    return await conn.fetchrow(_SELECT_ONE, viewer_id, post_id)
+# --- Yorum ----------------------------------------------------------------------
 
 
-async def promote_pending(conn: asyncpg.Connection, workout_id: uuid.UUID, author_id: uuid.UUID) -> bool:
-    row = await conn.fetchrow(_PROMOTE_PENDING, workout_id, author_id)
-    return row is not None
-
-
-async def sweep_stale_pending(conn: asyncpg.Connection) -> int:
-    rows = await conn.fetch(_DELETE_STALE_PENDING)
-    return len(rows)
-
-
-async def delete(conn: asyncpg.Connection, post_id: uuid.UUID, author_id: uuid.UUID) -> bool:
-    row = await conn.fetchrow(_DELETE_POST, post_id, author_id)
-    return row is not None
-
-
-async def find_photo_post_ids_by_author(conn: asyncpg.Connection, user_id: uuid.UUID) -> list[uuid.UUID]:
-    """Silinmeden ÖNCE çağrılır — MinIO nesnesi Postgres transaction'ının dışında
-    olduğu için router burada dönen id listesiyle `storage.delete_photo`'yu
-    her biri için ayrı ayrı çağırır (bkz. app/routers/internal.py)."""
-    rows = await conn.fetch(_SELECT_PHOTO_POST_IDS_BY_AUTHOR, user_id)
-    return [row["id"] for row in rows]
-
-
-async def delete_all_for_user(conn: asyncpg.Connection, user_id: uuid.UUID) -> None:
-    await conn.execute(_DELETE_POSTS_BY_AUTHOR, user_id)
-    await conn.execute(_DELETE_LIKES_BY_USER, user_id)
-    await conn.execute(_DELETE_COMMENTS_BY_AUTHOR, user_id)
-
-
-async def fetch_feed(
-    conn: asyncpg.Connection,
-    viewer_id: uuid.UUID,
-    cursor: str | None,
-    limit: int,
-) -> list[asyncpg.Record]:
-    created_at, item_id = decode_cursor(cursor)
-    return await conn.fetch(_SELECT_FEED, viewer_id, created_at, item_id, limit)
-
-
-async def like(conn: asyncpg.Connection, post_id: uuid.UUID, user_id: uuid.UUID) -> None:
-    await conn.execute(_UPSERT_LIKE, post_id, user_id)
-
-
-async def unlike(conn: asyncpg.Connection, post_id: uuid.UUID, user_id: uuid.UUID) -> None:
-    await conn.execute(_DELETE_LIKE, post_id, user_id)
+def _comment_row(snap) -> dict:
+    d = snap.to_dict()
+    return {
+        "id": uuid.UUID(snap.id),
+        "post_id": uuid.UUID(d["post_id"]),
+        "author_id": uuid.UUID(d["author_id"]),
+        "body": d["body"],
+        "created_at": d["created_at"],
+        "parent_comment_id": uuid.UUID(d["parent_comment_id"]) if d.get("parent_comment_id") else None,
+    }
 
 
 async def add_comment(
-    conn: asyncpg.Connection,
     *,
     comment_id: uuid.UUID,
     post_id: uuid.UUID,
     author_id: uuid.UUID,
     body: str,
     parent_comment_id: uuid.UUID | None = None,
-) -> None:
-    await conn.execute(_INSERT_COMMENT, comment_id, post_id, author_id, body, parent_comment_id)
+) -> dict | None:
+    """Yeni yorum oluşturur ve satırını döner; kimlik zaten varsa `None`
+    (eşzamanlı idempotent tekrar — çağıran mevcut kaydı okur)."""
+    data = {
+        "post_id": str(post_id),
+        "author_id": str(author_id),
+        "body": body,
+        "created_at": datetime.now(timezone.utc),
+        "parent_comment_id": str(parent_comment_id) if parent_comment_id else None,
+    }
+    try:
+        await _comments().document(str(comment_id)).create(data)
+    except AlreadyExists:
+        return None
+    return {**data, "id": comment_id, "post_id": post_id, "author_id": author_id,
+            "parent_comment_id": parent_comment_id}
 
 
-async def find_comment_by_id(conn: asyncpg.Connection, comment_id: uuid.UUID) -> asyncpg.Record | None:
-    return await conn.fetchrow(_FIND_COMMENT_BY_ID, comment_id)
+async def find_comment_by_id(comment_id: uuid.UUID) -> dict | None:
+    snap = await _comments().document(str(comment_id)).get()
+    return _comment_row(snap) if snap.exists else None
 
 
-async def fetch_comments(
-    conn: asyncpg.Connection, post_id: uuid.UUID, cursor: str | None, limit: int
-) -> list[asyncpg.Record]:
-    if cursor is None:
-        created_at, item_id = datetime.fromtimestamp(0, tz=timezone.utc), uuid.UUID(int=0)
-    else:
-        created_at, item_id = decode_cursor(cursor)
-    return await conn.fetch(_SELECT_COMMENTS, post_id, created_at, item_id, limit)
+async def _with_authors(rows: list[dict]) -> list[dict]:
+    """Yorum yazarı profili — INNER JOIN semantiği (profili olmayan düşer)."""
+    authors = await profiles.profiles_map(r["author_id"] for r in rows)
+    out = []
+    for r in rows:
+        author = authors.get(r["author_id"])
+        if author is None:
+            continue
+        out.append({**r, "username": author.username, "display_name": author.display_name,
+                    "avatar_seed": author.avatar_seed})
+    return out
 
 
-async def fetch_replies(conn: asyncpg.Connection, parent_comment_id: uuid.UUID) -> list[asyncpg.Record]:
-    return await conn.fetch(_SELECT_REPLIES, parent_comment_id)
+async def fetch_comments(post_id: uuid.UUID, cursor: str | None, limit: int) -> list[dict]:
+    """★ YALNIZCA ÜST SEVİYE ★ + her birinin `reply_count`'u.
+
+    Gönderinin TÜM yorumları tek eşitlik sorgusuyla okunup bellekte
+    ayrılıyor: "post_id == X AND parent IS NULL ORDER BY created_at" bileşik
+    indeks isterdi. Yanıt sayısı da aynı okumadan, ek sorgu olmadan çıkıyor.
+    Okuma: gönderideki yorum sayısı (gerçek kullanımda onlarca).
+    """
+    after = decode_cursor(cursor) if cursor is not None else None
+    query = _comments().where(filter=firestore.FieldFilter("post_id", "==", str(post_id)))
+    all_rows = [_comment_row(s) async for s in query.stream()]
+    reply_counts: dict[uuid.UUID, int] = {}
+    for r in all_rows:
+        if r["parent_comment_id"] is not None:
+            reply_counts[r["parent_comment_id"]] = reply_counts.get(r["parent_comment_id"], 0) + 1
+    top = sorted((r for r in all_rows if r["parent_comment_id"] is None),
+                 key=lambda r: (r["created_at"], str(r["id"])))
+    if after is not None:
+        top = [r for r in top if (r["created_at"], str(r["id"])) > (after[0], str(after[1]))]
+    page = [{**r, "reply_count": reply_counts.get(r["id"], 0)} for r in top[:limit]]
+    return await _with_authors(page)
+
+
+async def fetch_replies(parent_comment_id: uuid.UUID) -> list[dict]:
+    """Tek seviye, sayfalamasız (en fazla 200) — Postgres'teki `_SELECT_REPLIES`."""
+    query = _comments().where(filter=firestore.FieldFilter("parent_comment_id", "==", str(parent_comment_id)))
+    rows = sorted([_comment_row(s) async for s in query.stream()], key=lambda r: (r["created_at"], str(r["id"])))
+    return await _with_authors(rows[:200])

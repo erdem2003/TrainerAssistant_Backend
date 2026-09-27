@@ -1,8 +1,8 @@
 """Sosyal profil: kullanici adi alma, arama, gorunum.
 
-TEK DOGRULUK KAYNAGI: ADR 0014. Kullanici adi `social_db`'de yasiyor,
-`user_db`'de degil — gerekce ADR'nin "Kullanıcı adı neden social_db'de"
-bolumunde.
+TEK DOGRULUK KAYNAGI: ADR 0014. Kullanici adi social servisinde yasiyor,
+user servisinde degil — gerekce ADR'nin "Kullanıcı adı neden social_db'de"
+bolumunde (Firestore'da `social_profiles` + `social_usernames` kilidi).
 """
 
 from __future__ import annotations
@@ -11,10 +11,9 @@ import uuid
 
 from fastapi import APIRouter, Header, Query
 
-from app.db import db
 from app.errors import conflict, not_found
 from app.identity import require_user_id
-from app.repo import profiles
+from app.repo import friendships, profiles
 from app.schemas import (
     ProfileOut,
     ProfileSearchOut,
@@ -28,31 +27,7 @@ _SEARCH_LIMIT_DEFAULT = 20
 _SEARCH_LIMIT_MAX = 50
 
 
-@router.post("/username", response_model=ProfileOut)
-async def claim_username(
-    body: UsernameClaimIn,
-    x_user_id: str | None = Header(default=None),
-) -> ProfileOut:
-    """Sosyali açar: kullanıcı adını alır, `social_enabled=true` yapar.
-
-    409: kullanıcı adı başkasında ya da 30 günlük soğuma listesinde
-    (`retired_usernames` — ADR 0014, "kullanıcı adı yeniden alınamaz").
-    """
-    user_id = require_user_id(x_user_id)
-
-    async with db.pool.acquire() as conn:
-        await profiles.ensure_placeholder(conn, user_id, body.username)
-
-        if await profiles.is_username_taken(conn, body.username, user_id):
-            raise conflict(
-                "Bu kullanıcı adı alınmış",
-                {"username": body.username},
-            )
-
-        await profiles.claim_username(conn, user_id, body.username, body.display_name)
-        profile = await profiles.find_by_user_id(conn, user_id)
-
-    assert profile is not None
+def _profile_out(profile: profiles.SocialProfile) -> ProfileOut:
     return ProfileOut(
         user_id=str(profile.user_id),
         username=profile.username,
@@ -62,12 +37,32 @@ async def claim_username(
     )
 
 
+@router.post("/username", response_model=ProfileOut)
+async def claim_username(
+    body: UsernameClaimIn,
+    x_user_id: str | None = Header(default=None),
+) -> ProfileOut:
+    """Sosyali açar: kullanıcı adını alır, `social_enabled=true` yapar.
+
+    409: kullanıcı adı başkasında ya da emekli (hesap silmeyle serbest kalmış —
+    ADR 0014, "kullanıcı adı yeniden alınamaz"). Kontrol ve alım TEK
+    transaction'da: eşzamanlı iki alımdan yalnızca biri kazanır.
+    """
+    user_id = require_user_id(x_user_id)
+
+    try:
+        profile = await profiles.claim_username(user_id, body.username, body.display_name)
+    except profiles.UsernameTaken:
+        raise conflict("Bu kullanıcı adı alınmış", {"username": body.username}) from None
+
+    return _profile_out(profile)
+
+
 @router.get("/me", response_model=ProfileOut)
 async def my_profile(x_user_id: str | None = Header(default=None)) -> ProfileOut:
     user_id = require_user_id(x_user_id)
 
-    async with db.pool.acquire() as conn:
-        profile = await profiles.find_by_user_id(conn, user_id)
+    profile = await profiles.find_by_user_id(user_id)
 
     if profile is None:
         return ProfileOut(
@@ -78,13 +73,7 @@ async def my_profile(x_user_id: str | None = Header(default=None)) -> ProfileOut
             social_enabled=False,
         )
 
-    return ProfileOut(
-        user_id=str(profile.user_id),
-        username=profile.username,
-        display_name=profile.display_name,
-        avatar_seed=profile.avatar_seed,
-        social_enabled=profile.social_enabled,
-    )
+    return _profile_out(profile)
 
 
 @router.get("/search", response_model=ProfileSearchOut)
@@ -94,41 +83,39 @@ async def search_profiles(
     x_user_id: str | None = Header(default=None),
 ) -> ProfileSearchOut:
     """Yalnızca `social_enabled=true` profiller döner (opt-in, ADR 0014 karar #1),
-    kendisi hariç (ADR 0017 — `_SEARCH` artık `viewer_id`'yi dışlıyor).
+    kendisi hariç (ADR 0017).
 
-    Dönen alanlar bilerek dar: yalnızca ad + avatar (ADR 0014 karar #3) —
-    arama sonucu arkadaş olmayan biri hakkında hiçbir performans verisi
-    sızdırmamalı. `relationship_status` (ADR 0017) ayrı: bu bir performans
-    verisi değil, "Ekle" butonunun doğru durumda görünmesi için gerekli —
-    olmadan istemci zaten-arkadaş ya da zaten-PENDING birine tekrar istek
-    göndermeyi dener, sunucu sessizce hiçbir şey değiştirmeden 200 döner ve
-    kullanıcı "çalışmıyor" sanır.
+    Dönen alanlar bilerek dar: yalnızca ad + avatar (ADR 0014 karar #3).
+    `relationship_status` (ADR 0017) "Ekle" butonunun doğru durumda görünmesi
+    için — olmadan istemci zaten-arkadaş ya da zaten-PENDING birine tekrar
+    istek göndermeyi dener ve kullanıcı "çalışmıyor" sanır.
     """
     viewer_id = require_user_id(x_user_id)
 
-    async with db.pool.acquire() as conn:
-        rows = await profiles.search(conn, q, limit, viewer_id)
+    found = await profiles.search(q, limit, viewer_id)
+    statuses = await friendships.statuses_with(viewer_id, [p.user_id for p in found])
 
-    def _relationship_status(row) -> str:
-        status = row["friendship_status"]
-        if status is None:
+    def _relationship_status(profile: profiles.SocialProfile) -> str:
+        entry = statuses.get(profile.user_id)
+        if entry is None:
             return "NONE"
+        status, requested_by = entry
         if status == "ACCEPTED":
             return "FRIENDS"
-        if row["friendship_requested_by"] == viewer_id:
+        if requested_by == viewer_id:
             return "PENDING_OUTGOING"
         return "PENDING_INCOMING"
 
     return ProfileSearchOut(
         items=[
             ProfileSummaryOut(
-                user_id=str(r["user_id"]),
-                username=r["username"],
-                display_name=r["display_name"],
-                avatar_seed=r["avatar_seed"],
-                relationship_status=_relationship_status(r),
+                user_id=str(p.user_id),
+                username=p.username,
+                display_name=p.display_name,
+                avatar_seed=p.avatar_seed,
+                relationship_status=_relationship_status(p),
             )
-            for r in rows
+            for p in found
         ]
     )
 
@@ -140,10 +127,7 @@ async def get_profile(
 ) -> ProfileSummaryOut:
     """Arkadaş olmayan biri için de sınırlı gövde döner — 403 değil.
 
-    404 yalnızca profil hiç yoksa (kullanıcı sosyali hiç açmamış). Var olan
-    ama arkadaş olunmayan bir profili gizlemek `service-contract` §3'ün
-    "başkasının kaynağı 404" kuralının ötesinde bir durum: burada kaynak
-    GERÇEKTEN var, yalnızca görünürlüğü daralıyor — bu yüzden 200 + dar gövde.
+    404 yalnızca profil hiç yoksa (kullanıcı sosyali hiç açmamış).
     """
     require_user_id(x_user_id)
     try:
@@ -151,14 +135,9 @@ async def get_profile(
     except ValueError:
         raise not_found() from None
 
-    # v1'de arkadaş olsun olmasın dönen alanlar zaten aynı (yalnız ad+avatar,
-    # ADR 0014 karar #3) — bu yüzden burada `are_friends` kontrolü YOK. Skor/
-    # gönderi gibi genişletilmiş alanlar eklendiğinde (S4/S5) bu uç arkadaş
-    # olmayana onları göstermemek için `friendships.are_friends`'i çağıracak.
-    async with db.pool.acquire() as conn:
-        profile = await profiles.find_by_user_id(conn, target)
-        if profile is None or not profile.social_enabled:
-            raise not_found("Kullanıcı bulunamadı")
+    profile = await profiles.find_by_user_id(target)
+    if profile is None or not profile.social_enabled:
+        raise not_found("Kullanıcı bulunamadı")
 
     return ProfileSummaryOut(
         user_id=str(profile.user_id),

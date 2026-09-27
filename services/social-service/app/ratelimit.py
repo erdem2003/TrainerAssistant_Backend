@@ -1,59 +1,63 @@
-"""Redis tabanlı hız sınırlama (ADR 0014, Faz S10).
+"""Süreç içi hız sınırlama (ADR 0014 Faz S10; ADR 0019 karar 6).
 
-`auth-service/app/ratelimit.py` ile AYNI Lua betiği ve desen — servisler kod
-paylaşmıyor (ADR 0005). Kapsam: gönderi oluşturma, yorum, arkadaşlık isteği
-(plan dosyasının S10 listesi) — spam/kötüye kullanım sınırı, kimlik doğrulama
-değil.
+Redis kalktı: dağıtım tek süreç (ADR 0019 karar 1), sayaçların süreç belleğinde
+durması DOĞRU sonuç veriyor. Arayüz Redis sürümüyle AYNI (`connect/close/hit`),
+router'lar değişmedi. Pencere biçimi de aynı: sabit pencere — ilk vuruşta
+başlar, `window_seconds` sonra sıfırlanır (Redis'teki INCR + EXPIRE).
+
+Bilinen bedel: süreç yeniden başlarsa sayaçlar sıfırlanır (Render'ın uyku/
+uyanma döngüsü dahil). Kapsam spam sınırı, kimlik doğrulama değil — kabul
+edilebilir. Birden çok süreçe geçilirse Render Key Value (Redis) sürümüne
+dönülmeli; arayüz aynı olduğu için yalnızca bu dosya değişir.
 """
 
 from __future__ import annotations
 
-import logging
+import asyncio
+import time
 
-import redis.asyncio as redis
-from redis.commands.core import AsyncScript
-
-from app.config import settings
 from app.errors import rate_limited
 
-logger = logging.getLogger(__name__)
-
-_INCR_WITH_TTL = """
-local current = redis.call('INCR', KEYS[1])
-if current == 1 then
-    redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-return {current, redis.call('TTL', KEYS[1])}
-"""
+# Bellek sızmasın: süresi dolmuş anahtarlar bu kadar vuruşta bir süpürülüyor.
+_SWEEP_EVERY = 1000
 
 
 class RateLimiter:
     def __init__(self) -> None:
-        self._client: redis.Redis | None = None
-        self._script: AsyncScript | None = None
+        self._windows: dict[str, tuple[float, int]] = {}
+        self._lock = asyncio.Lock()
+        self._hits = 0
 
     async def connect(self) -> None:
-        self._client = redis.from_url(settings.redis_url, decode_responses=True)
-        self._script = self._client.register_script(_INCR_WITH_TTL)
+        return None
 
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        self._windows.clear()
+
+    def reset(self) -> None:
+        """Testler için."""
+        self._windows.clear()
 
     async def hit(self, key: str, limit: int, window_seconds: int) -> None:
-        if self._client is None or self._script is None:
-            return
-        try:
-            current, ttl = await self._script(keys=[key], args=[window_seconds])
-        except Exception:
-            # Açık kapı: Redis yoksa yazma durmamalı — auth-service'teki
-            # aynı gerekçe.
-            logger.exception("hız sınırı kontrol edilemedi, istek geçiriliyor")
-            return
+        now = time.monotonic()
+        async with self._lock:
+            started, count = self._windows.get(key, (now, 0))
+            if now - started >= window_seconds:
+                started, count = now, 0
+            count += 1
+            self._windows[key] = (started, count)
+            self._hits += 1
+            if self._hits % _SWEEP_EVERY == 0:
+                self._sweep(now, window_seconds)
+        if count > limit:
+            raise rate_limited(max(int(window_seconds - (now - started)), 1))
 
-        if int(current) > limit:
-            raise rate_limited(max(int(ttl), 1))
+    def _sweep(self, now: float, window_seconds: int) -> None:
+        # Pencere uzunlukları anahtara göre değişiyor (10 dk / 1 sa); en uzun
+        # pencereden (1 sa) eski olan her anahtar güvenle atılabilir.
+        horizon = max(window_seconds, 3600)
+        for key in [k for k, (started, _) in self._windows.items() if now - started >= horizon]:
+            del self._windows[key]
 
 
 limiter = RateLimiter()

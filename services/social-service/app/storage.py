@@ -1,72 +1,55 @@
-"""MinIO nesne deposu istemcisi — motivasyon gönderisi fotoğrafları (ADR 0016).
+"""Firebase Storage — motivasyon gönderisi fotoğrafları (ADR 0016, ADR 0019 karar 4).
 
-★ AĞA AÇILMIYOR ★ Yalnızca social-service içeriden erişir. Mobil istemci
-fotoğrafı asla doğrudan MinIO'dan çekmez — `GET /v1/social/posts/{id}/photo`
-üzerinden, arkadaşlık kontrolünden geçerek social-service'in kendisi akıtır
-(docs/architecture/overview.md §3, "tek public giriş: api-gateway").
+MinIO'nun yerini aldı. Nesne yolu `posts/{postId}/photo`, kova
+`nabiz-trainer.firebasestorage.app` (`FIREBASE_STORAGE_BUCKET` ile değişir).
 
-`minio` SDK'sı SENKRON — bu modülün her fonksiyonu router tarafında
-`starlette.concurrency.run_in_threadpool` ile sarmalanmalı, aksi halde tek
-bir yükleme event loop'u tıkar.
+★ ŞİMDİLİK SERVİS ÜZERİNDEN ★ Yükleme ve okuma hâlâ
+`POST /v1/social/posts/motivation` ve `GET /v1/social/posts/{id}/photo` uçlarından
+geçiyor — mobil sözleşme değişmedi. ADR 0019'un hedefi istemcinin doğrudan
+Storage'a yüklemesi (kural: yalnız yazar yazar, oturum açmış herkes okur);
+geçildiğinde bu modül yalnızca silme için kalır.
+
+`google-cloud-storage` SENKRON — router bu fonksiyonları
+`run_in_threadpool` ile çağırıyor (MinIO sürümüyle aynı sözleşme), aksi hâlde
+tek bir yükleme olay döngüsünü tıkar.
 """
 
 from __future__ import annotations
 
-import io
 import logging
-from functools import lru_cache
 
-from minio import Minio
-from minio.error import S3Error
-
-from app.config import settings
+from google.api_core.exceptions import NotFound
+from nabiz_firebase.admin import firebase_app
 
 logger = logging.getLogger(__name__)
 
 
-@lru_cache
-def _client() -> Minio:
-    client = Minio(
-        settings.minio_endpoint,
-        access_key=settings.minio_access_key,
-        secret_key=settings.minio_secret_key,
-        secure=settings.minio_secure,
-    )
-    if not client.bucket_exists(settings.minio_bucket):
-        client.make_bucket(settings.minio_bucket)
-    return client
+def photo_path(post_id: str) -> str:
+    return f"posts/{post_id}/photo"
+
+
+def _bucket():
+    from firebase_admin import storage  # noqa: PLC0415 — yalnızca kullanılınca yüklensin
+
+    return storage.bucket(app=firebase_app())
 
 
 def put_photo(post_id: str, data: bytes, content_type: str) -> None:
-    _client().put_object(
-        settings.minio_bucket,
-        post_id,
-        io.BytesIO(data),
-        length=len(data),
-        content_type=content_type,
-    )
+    _bucket().blob(photo_path(post_id)).upload_from_string(data, content_type=content_type)
 
 
 def get_photo(post_id: str) -> tuple[bytes, str] | None:
-    try:
-        response = _client().get_object(settings.minio_bucket, post_id)
-    except S3Error as exc:
-        if exc.code == "NoSuchKey":
-            return None
-        raise
-    try:
-        data = response.read()
-        content_type = response.headers.get("Content-Type", "application/octet-stream")
-        return data, content_type
-    finally:
-        response.close()
-        response.release_conn()
+    blob = _bucket().get_blob(photo_path(post_id))
+    if blob is None:
+        return None
+    return blob.download_as_bytes(), blob.content_type or "application/octet-stream"
 
 
 def delete_photo(post_id: str) -> None:
     try:
-        _client().remove_object(settings.minio_bucket, post_id)
-    except S3Error as exc:
+        _bucket().blob(photo_path(post_id)).delete()
+    except NotFound:
         # Zaten yok — hesap silme/idempotent tekrar bu yolu meşru geçer.
-        if exc.code != "NoSuchKey":
-            logger.warning("MinIO fotoğraf silme hatası post_id=%s: %s", post_id, exc)
+        return
+    except Exception:
+        logger.warning("Storage fotoğraf silme hatası post_id=%s", post_id, exc_info=True)

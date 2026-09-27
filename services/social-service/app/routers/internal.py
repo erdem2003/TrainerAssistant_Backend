@@ -1,10 +1,12 @@
 """DELETE /internal/users/{id} — hesap silindiginde sosyal veriyi temizler.
-Gateway bu yolu yayinlamaz; yalnizca compose agi icinden cagrilir.
+Gateway bu yolu yayinlamaz; yalnizca servisler arasi cagrilir.
 
-`workout-service/app/routers/internal.py`'nin deseni, ama silme kapsami
-daha genis: profil, arkadaslik (her iki tarafta), ve bir TOMBSTONE
-(`deleted_users`) — S3'te eklenecek `workout.session` tuketicisinin gecikmeli
-gelen bir event icin satiri DIRILTMEMESI icin (ADR 0014, Sonuclar).
+Silme kapsami: profil (ad EMEKLI kilide doner), arkadasliklar (her iki taraf),
+gonderiler (kaskadla begeni/yorum/klip), baskalarinin gonderisine birakilan
+begeni/yorum, snapshot'lar + bildirimler (`social_users/{uid}` altinda),
+meydan okuma katilimlari/kurduklari, kudos, fotograflar — ve bir TOMBSTONE
+(`social_deleted_users`): gecikmeli ya da replay'deki bir `workout.session`
+olayi silinmis kullanicinin snapshot'ini DIRILTMESIN (ADR 0014, Sonuclar).
 """
 
 from __future__ import annotations
@@ -17,17 +19,23 @@ from starlette.concurrency import run_in_threadpool
 
 from app import storage
 from app.config import settings
-from app.db import db
+from app.db import db, user_doc
 from app.errors import ApiError, forbidden, unprocessable
-from app.repo import challenges, friendships, notifications, posts, processed_events, profiles, snapshots
+from app.repo import (
+    challenges,
+    friendships,
+    posts,
+    processed_events,
+    profiles,
+    snapshots,
+    tombstones,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
 EVENT_ACCOUNT_DELETED = "AccountDeleted"
-
-_INSERT_TOMBSTONE = "INSERT INTO deleted_users (user_id) VALUES ($1) ON CONFLICT DO NOTHING"
 
 
 def _require_internal_key(provided: str | None) -> None:
@@ -51,7 +59,6 @@ async def delete_user_data(
         raise ApiError(
             status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "X-Event-Id başlığı zorunlu"
         )
-
     try:
         event_id = uuid.UUID(x_event_id)
     except ValueError:
@@ -59,57 +66,49 @@ async def delete_user_data(
             status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "X-Event-Id geçerli bir UUID olmalı"
         ) from None
 
-    async with db.pool.acquire() as conn:
-        async with conn.transaction():
-            first_time = await processed_events.claim(conn, event_id, EVENT_ACCOUNT_DELETED)
-            if not first_time:
-                logger.info("event zaten işlenmiş, atlanıyor event_id=%s", event_id)
-                return Response(status_code=status.HTTP_204_NO_CONTENT)
+    # ★ SIRA: ÖNCE SİL, SONRA İŞARETLE ★ (health-service deseni) — silme
+    # adımları bir transaction'a sığmıyor ama her biri idempotent; arada
+    # çökülürse yeniden teslimde kalan kısım silinir. Ters sıra veriyi
+    # sonsuza kadar bırakırdı.
+    if await processed_events.exists(event_id):
+        logger.info("event zaten işlenmiş, atlanıyor event_id=%s", event_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-            deleted_friendships = await friendships.delete_all_for_user(conn, user_id)
-            await profiles.delete_and_retire(conn, user_id)
-            deleted_snapshots = await snapshots.delete_by_user(conn, user_id)
-            # ADR 0016 — MinIO nesnesi Postgres transaction'ının dışında; satır
-            # silinmeden ÖNCE hangi gönderilerin fotoğrafı olduğu okunuyor,
-            # transaction commit olduktan SONRA (fonksiyonun sonunda) MinIO'dan
-            # siliniyor. Sıra tersine çevrilseydi (önce MinIO, sonra DB) ve
-            # transaction rollback olsaydı fotoğraf kalıcı kaybolurdu.
-            photo_post_ids = await posts.find_photo_post_ids_by_author(conn, user_id)
-            # Kendi gönderileri (CASCADE ile kendi beğeni/yorumları da gider)
-            # + başkalarının gönderilerine bıraktığı beğeni/yorum.
-            await posts.delete_all_for_user(conn, user_id)
-            # Yalnızca KENDİ gelen kutusu silinir — bu kullanıcının bir
-            # başkasına AKTÖR olarak bıraktığı bildirimler (S10'a kadar)
-            # `NotificationActorOut`'un tüm alanları opsiyonel olduğu için
-            # "Silinmiş kullanıcı" olarak LEFT JOIN ile zaten güvenle gösteriliyor.
-            await notifications.delete_by_recipient(conn, user_id)
-            await challenges.delete_for_user(conn, user_id)
-            await challenges.delete_kudos_by_giver(conn, user_id)
-            await conn.execute(_INSERT_TOMBSTONE, user_id)
-            # Tombstone AYRICA gerekli: silme sonrası gecikmiş bir
-            # `workout.session` eventi gelirse (Kafka'da hâlâ kuyrukta),
-            # `workout_snapshots` tüketicisi bu tabloyu kontrol edip satırı
-            # DİRİLTMEZ (aşağıdaki `deleted_users`, `app/worker/
-            # workout_consumer.py`'nin tombstone kontrolüyle aynı tablo).
+    # Tombstone EN BAŞTA: silme sürerken gelen bir olay snapshot'ı yeniden
+    # yazmasın.
+    await tombstones.mark(user_id)
 
+    deleted_friendships = await friendships.delete_all_for_user(user_id)
+    await profiles.delete_and_retire(user_id)
+    deleted_owners = await snapshots.delete_by_user(user_id)
+    deleted_posts = await posts.delete_all_for_user(user_id)
+    await challenges.delete_for_user(user_id)
+    await challenges.delete_kudos_by_giver(user_id)
+    # Snapshot'lar + KENDİ gelen kutusu. Bu kullanıcının başkasına AKTÖR olarak
+    # bıraktığı bildirimler kalıyor — okuma yolu silinmiş aktörü "Silinmiş
+    # kullanıcı" olarak gösteriyor (Postgres dalıyla aynı).
+    await db.client.recursive_delete(user_doc(user_id))
+
+    # Fotoğraflar Firestore silmesinden SONRA: ters sırada, silme yarıda
+    # kalırsa fotoğrafı olmayan görünür gönderi kalırdı.
+    photo_post_ids = [p.id for p in deleted_posts if p.photo_content_type is not None]
     for pid in photo_post_ids:
         await run_in_threadpool(storage.delete_photo, str(pid))
 
+    await processed_events.claim(event_id, EVENT_ACCOUNT_DELETED)
+
     logger.info(
         "hesap silme işlendi user_id=%s silinen_arkadaşlık=%s silinen_antrenman=%s silinen_fotoğraf=%s",
-        user_id, deleted_friendships, deleted_snapshots, len(photo_post_ids),
+        user_id, deleted_friendships, deleted_owners, len(photo_post_ids),
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- chat-service'in cagirdigi ic uclar (Faz S6) -----------------------------
 #
-# `chat_db`'de ne arkadaslik ne de kullanici adi var (ADR 0005: veritabani
-# basina servis). Bu iki uc, chat-service'in yazma yetkisini (arkadas mi) ve
-# okuma goruntusunu (konusma listesindeki ad/kullanici adi) kurmasi icin
-# gereken TEK senkron cagrilar — ADR 0005'in izin verdigi "minimum senkron
-# cagri" istisnasi, `auth-service/app/worker/fanout.py`'nin silme cagrilarinin
-# ayni sinifinda.
+# chat-service'te ne arkadaslik ne de kullanici adi var (ADR 0005). Bu iki uc,
+# chat-service'in yazma yetkisini (arkadas mi) ve okuma goruntusunu (konusma
+# listesindeki ad) kurmasi icin gereken TEK senkron cagrilar.
 
 
 @router.get("/friendships/check")
@@ -122,10 +121,7 @@ async def check_friendship(
     if a == b:
         raise unprocessable("a ve b aynı olamaz")
 
-    async with db.pool.acquire() as conn:
-        result = await friendships.are_friends(conn, a, b)
-
-    return {"are_friends": result}
+    return {"are_friends": await friendships.are_friends(a, b)}
 
 
 @router.get("/profiles/batch")
@@ -134,7 +130,6 @@ async def batch_profiles(
     x_internal_key: str | None = Header(default=None),
 ) -> dict:
     _require_internal_key(x_internal_key)
-
     try:
         user_ids = [uuid.UUID(raw.strip()) for raw in ids.split(",") if raw.strip()]
     except ValueError:
@@ -143,8 +138,7 @@ async def batch_profiles(
     if not user_ids:
         return {"items": []}
 
-    async with db.pool.acquire() as conn:
-        results = await profiles.find_by_user_ids(conn, user_ids)
+    results = await profiles.find_by_user_ids(user_ids)
 
     return {
         "items": [

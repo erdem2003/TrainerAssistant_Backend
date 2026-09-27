@@ -2,6 +2,10 @@
 
 TEK DOGRULUK KAYNAGI: `app/repo/friendships.py` — kanonik cift tasarimi ve
 otomatik-kabul mantiginin gerekcesi orada.
+
+Bildirim dokumani yaziminin kendisi gercek zamanli sinyal (ADR 0019 karar 5):
+mobil `social_users/{uid}/notifications`'i dinliyor; Redis uyandirma cagrisi
+(`app/notify.py`) kalkti.
 """
 
 from __future__ import annotations
@@ -10,8 +14,6 @@ import uuid
 
 from fastapi import APIRouter, Header
 
-from app import notify
-from app.db import db
 from app.errors import not_found, unprocessable
 from app.identity import require_user_id
 from app.ratelimit import friend_request_key, limiter
@@ -36,24 +38,24 @@ def _epoch_ms(dt) -> int:
 async def list_friends(x_user_id: str | None = Header(default=None)) -> FriendListOut:
     user_id = require_user_id(x_user_id)
 
-    async with db.pool.acquire() as conn:
-        rows = await friendships.list_friends(conn, user_id)
-        items = []
-        for row in rows:
-            profile = await profiles.find_by_user_id(conn, row["friend_id"])
-            if profile is None:
-                # Profil satırı silinmiş (hesap silme fanout'u henüz
-                # işlenmemiş olabilir) — bu satırı atla, çökme yerine.
-                continue
-            items.append(
-                FriendOut(
-                    user_id=str(profile.user_id),
-                    username=profile.username,
-                    display_name=profile.display_name,
-                    avatar_seed=profile.avatar_seed,
-                    since=_epoch_ms(row["created_at"]),
-                )
+    rows = await friendships.list_friends(user_id)
+    by_id = await profiles.profiles_map(row["friend_id"] for row in rows)
+    items = []
+    for row in rows:
+        profile = by_id.get(row["friend_id"])
+        if profile is None:
+            # Profil silinmiş (hesap silme fanout'u henüz işlenmemiş olabilir)
+            # — bu satırı atla, çökme yerine.
+            continue
+        items.append(
+            FriendOut(
+                user_id=str(profile.user_id),
+                username=profile.username,
+                display_name=profile.display_name,
+                avatar_seed=profile.avatar_seed,
+                since=_epoch_ms(row["created_at"]),
             )
+        )
 
     return FriendListOut(items=items)
 
@@ -62,10 +64,15 @@ async def list_friends(x_user_id: str | None = Header(default=None)) -> FriendLi
 async def list_requests(x_user_id: str | None = Header(default=None)) -> PendingRequestsOut:
     user_id = require_user_id(x_user_id)
 
-    async def _build(rows: list[dict], key: str, conn) -> list[PendingRequestOut]:
+    incoming_rows, outgoing_rows = await friendships.list_pending(user_id)
+    by_id = await profiles.profiles_map(
+        [r["requester_id"] for r in incoming_rows] + [r["addressee_id"] for r in outgoing_rows]
+    )
+
+    def _build(rows: list[dict], key: str) -> list[PendingRequestOut]:
         out = []
         for row in rows:
-            profile = await profiles.find_by_user_id(conn, row[key])
+            profile = by_id.get(row[key])
             if profile is None:
                 continue
             out.append(
@@ -79,13 +86,10 @@ async def list_requests(x_user_id: str | None = Header(default=None)) -> Pending
             )
         return out
 
-    async with db.pool.acquire() as conn:
-        incoming_rows = await friendships.list_pending_incoming(conn, user_id)
-        outgoing_rows = await friendships.list_pending_outgoing(conn, user_id)
-        incoming = await _build(incoming_rows, "requester_id", conn)
-        outgoing = await _build(outgoing_rows, "addressee_id", conn)
-
-    return PendingRequestsOut(incoming=incoming, outgoing=outgoing)
+    return PendingRequestsOut(
+        incoming=_build(incoming_rows, "requester_id"),
+        outgoing=_build(outgoing_rows, "addressee_id"),
+    )
 
 
 @router.post("", response_model=FriendshipStatusOut)
@@ -106,34 +110,21 @@ async def send_request(
     if target == me:
         raise unprocessable("kendine arkadaşlık isteği gönderemezsin")
 
-    async with db.pool.acquire() as conn:
-        target_profile = await profiles.find_by_user_id(conn, target)
-        if target_profile is None or not target_profile.social_enabled:
-            raise not_found("Kullanıcı bulunamadı")
+    target_profile = await profiles.find_by_user_id(target)
+    if target_profile is None or not target_profile.social_enabled:
+        raise not_found("Kullanıcı bulunamadı")
 
-        result = await friendships.send_request(conn, me, target)
+    result = await friendships.send_request(me, target)
 
-        # ★ HANGİ TARAF NE GÖRÜR ★ PENDING: karşı taraf yeni bir istek aldı.
-        # ACCEPTED (karşılıklı istek): karşı taraf zaten bekliyordu, benim
-        # isteğim onunkini KABUL etti — bana ayrıca "istek geldi" göstermek
-        # yanlış olurdu, o yüzden bu durumda FRIEND_ACCEPTED gönderiliyor.
-        notif_type = "FRIEND_REQUEST" if result.status == "PENDING" else "FRIEND_ACCEPTED"
-        upserted = await notifications.upsert(
-            conn,
-            notification_id=uuid.uuid4(),
-            recipient_id=target,
-            notification_type=notif_type,
-            actor_id=me,
-            subject_id=me,
-        )
-
-    await notify.publish_notification(
-        target,
-        notification_id=upserted.id,
+    # ★ HANGİ TARAF NE GÖRÜR ★ PENDING: karşı taraf yeni bir istek aldı.
+    # ACCEPTED (karşılıklı istek): karşı taraf zaten bekliyordu, benim
+    # isteğim onunkini KABUL etti — bu durumda FRIEND_ACCEPTED gönderiliyor.
+    notif_type = "FRIEND_REQUEST" if result.status == "PENDING" else "FRIEND_ACCEPTED"
+    await notifications.upsert(
+        recipient_id=target,
         notification_type=notif_type,
         actor_id=me,
         subject_id=me,
-        created_at_ms=int(upserted.created_at.timestamp() * 1000),
     )
 
     return FriendshipStatusOut(status=result.status)
@@ -150,27 +141,14 @@ async def accept_request(
     except ValueError:
         raise not_found() from None
 
-    async with db.pool.acquire() as conn:
-        accepted = await friendships.accept(conn, me, requester)
-        if not accepted:
-            raise not_found("Bekleyen istek bulunamadı")
+    if not await friendships.accept(me, requester):
+        raise not_found("Bekleyen istek bulunamadı")
 
-        upserted = await notifications.upsert(
-            conn,
-            notification_id=uuid.uuid4(),
-            recipient_id=requester,
-            notification_type="FRIEND_ACCEPTED",
-            actor_id=me,
-            subject_id=me,
-        )
-
-    await notify.publish_notification(
-        requester,
-        notification_id=upserted.id,
+    await notifications.upsert(
+        recipient_id=requester,
         notification_type="FRIEND_ACCEPTED",
         actor_id=me,
         subject_id=me,
-        created_at_ms=int(upserted.created_at.timestamp() * 1000),
     )
 
 
@@ -185,8 +163,7 @@ async def reject_request(
     except ValueError:
         raise not_found() from None
 
-    async with db.pool.acquire() as conn:
-        await friendships.reject_or_unfriend(conn, me, requester)
+    await friendships.reject_or_unfriend(me, requester)
 
 
 @router.delete("/{friend_id}", status_code=204)
@@ -200,5 +177,4 @@ async def remove_friend(
     except ValueError:
         raise not_found() from None
 
-    async with db.pool.acquire() as conn:
-        await friendships.reject_or_unfriend(conn, me, friend)
+    await friendships.reject_or_unfriend(me, friend)

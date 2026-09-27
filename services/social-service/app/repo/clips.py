@@ -1,37 +1,27 @@
-"""shared_clips SQL — iskelet klibi paylaşımı (ADR 0015, Faz S11).
+"""İskelet klibi paylaşımı (ADR 0015, Faz S11) — `social_clips/{post_id}`.
 
-Bu modül landmark verisinin İÇERİĞİNİ hiç yorumlamaz — sunucu tarafında
-bir kare bile ayrıştırılmıyor, yalnızca JSONB olarak saklanıp geri veriliyor.
-Yorumlama (çizim, oynatma) tamamen mobil tarafta (`ReplayCanvas`).
+Bu modül landmark verisinin İÇERİĞİNİ hiç yorumlamaz — yalnızca saklayıp
+geri verir. Yorumlama (çizim, oynatma) tamamen mobil tarafta.
+
+★ NEDEN SIKIŞTIRILMIŞ JSON (Blob), NEDEN İÇ İÇE ALAN DEĞİL ★
+450 kare × 33 landmark × 3 sayı iç içe Firestore alanı olarak (1) doküman
+başına 40.000 indeks girdisi sınırını zorlar, (2) ham JSON olarak ~600 KB ile
+1 MiB doküman sınırına yaklaşır. zlib'li JSON baytı indekslenmeyen tek bir
+Blob alanı; boyut birkaç kat küçülüyor. Postgres'teki JSONB'nin karşılığı:
+sunucu içeriği sorgulamıyordu, yalnızca saklıyordu.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
+import zlib
 from dataclasses import dataclass
 from datetime import datetime
 
-import asyncpg
+from google.cloud import firestore
 
-_UPSERT = """
-INSERT INTO shared_clips (post_id, landmark_sequence, frame_count, form_errors, image_width, image_height)
-VALUES ($1, $2::jsonb, $3, $4, $5, $6)
-ON CONFLICT (post_id) DO UPDATE SET
-    landmark_sequence = EXCLUDED.landmark_sequence,
-    frame_count        = EXCLUDED.frame_count,
-    form_errors         = EXCLUDED.form_errors,
-    image_width          = EXCLUDED.image_width,
-    image_height          = EXCLUDED.image_height,
-    created_at              = now()
-"""
-
-_FIND_BY_POST = """
-SELECT post_id, landmark_sequence, frame_count, form_errors, image_width, image_height, created_at
-  FROM shared_clips WHERE post_id = $1
-"""
-
-_HAS_CLIP_FOR_POSTS = "SELECT post_id FROM shared_clips WHERE post_id = ANY($1::uuid[])"
+from app.db import db
 
 
 @dataclass(frozen=True)
@@ -45,8 +35,11 @@ class SharedClip:
     created_at: datetime
 
 
+def _ref(post_id: uuid.UUID):
+    return db.collection("clips").document(str(post_id))
+
+
 async def upsert(
-    conn: asyncpg.Connection,
     *,
     post_id: uuid.UUID,
     landmark_sequence: list,
@@ -54,28 +47,41 @@ async def upsert(
     form_errors: list[str],
     image_width: int,
     image_height: int,
-) -> None:
-    await conn.execute(
-        _UPSERT, post_id, json.dumps(landmark_sequence), frame_count, form_errors, image_width, image_height
-    )
+) -> bool:
+    """Klibi yazar (varsa değiştirir) ve gönderinin `has_clip` bayrağını aynı
+    yığında açar; klip daha önce VAR MIYDI döner (201/200 ayrımı için).
+
+    `has_clip` bir sayaç değil, 1:1 ilişkinin varlık bayrağı — Postgres'te feed
+    sorgusu `LEFT JOIN shared_clips` ile aynı bilgiyi üretiyordu.
+    """
+    ref = _ref(post_id)
+    existed = (await ref.get()).exists
+    blob = zlib.compress(json.dumps(landmark_sequence, separators=(",", ":")).encode("utf-8"))
+    batch = db.client.batch()
+    batch.set(ref, {
+        "landmark_sequence_z": blob,
+        "frame_count": frame_count,
+        "form_errors": list(form_errors),
+        "image_width": image_width,
+        "image_height": image_height,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    batch.update(db.collection("posts").document(str(post_id)), {"has_clip": True})
+    await batch.commit()
+    return existed
 
 
-async def find_by_post(conn: asyncpg.Connection, post_id: uuid.UUID) -> SharedClip | None:
-    row = await conn.fetchrow(_FIND_BY_POST, post_id)
-    if row is None:
+async def find_by_post(post_id: uuid.UUID) -> SharedClip | None:
+    snap = await _ref(post_id).get()
+    if not snap.exists:
         return None
+    d = snap.to_dict()
     return SharedClip(
-        post_id=row["post_id"],
-        landmark_sequence=json.loads(row["landmark_sequence"]),
-        frame_count=row["frame_count"],
-        form_errors=list(row["form_errors"]),
-        image_width=row["image_width"],
-        image_height=row["image_height"],
-        created_at=row["created_at"],
+        post_id=post_id,
+        landmark_sequence=json.loads(zlib.decompress(d["landmark_sequence_z"]).decode("utf-8")),
+        frame_count=int(d["frame_count"]),
+        form_errors=list(d.get("form_errors") or []),
+        image_width=int(d["image_width"]),
+        image_height=int(d["image_height"]),
+        created_at=d.get("created_at"),
     )
-
-
-async def posts_with_clips(conn: asyncpg.Connection, post_ids: list[uuid.UUID]) -> set[uuid.UUID]:
-    """Feed sorgusu için: bu gönderilerden hangileri klip taşıyor (has_clip bayrağı)."""
-    rows = await conn.fetch(_HAS_CLIP_FOR_POSTS, post_ids)
-    return {r["post_id"] for r in rows}

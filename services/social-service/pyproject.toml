@@ -6,26 +6,21 @@ requires-python = ">=3.12"
 
 # `health-service` ile AYNI temel kume:
 #   - bcrypt / pyjwt YOK : bu servis credential tutmuyor, token dogrulamiyor.
-#                          Kimlik gateway'de dogrulaniyor (service-contract §2),
-#                          buraya X-User-Id olarak geliyor.
-#   - redis GEREKLI       : chat-service'e bildirim uyandirma sinyali gonderiyor
-#                          (ADR 0014, "Redis pub/sub"). Faz S6'da kullanilacak,
-#                          bagimlilik simdiden eklendi ki iki ayri PR gerekmesin.
+#   - redis / aiokafka / minio / asyncpg YOK (ADR 0019): veri Firestore'da,
+#     olaylar surec ici outbox dagiticisindan, fotograflar Firebase Storage'da,
+#     hiz siniri surec icinde, bildirim sinyali Firestore dinleyicisinde.
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "asyncpg>=0.30",
+    "google-cloud-firestore>=2.19",
+    # Firebase Storage (fotograf) + Auth — `nabiz_firebase.admin`.
+    "firebase-admin>=6.6",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
-    "redis>=5.1",
-    "aiokafka>=0.11",
     # Motivasyon gonderisi fotograf yuklemesi icin multipart/form-data govde
     # ayristirmasi — FastAPI'nin UploadFile/Form'u calisma zamaninda bunu
     # gerektiriyor (ADR 0016).
     "python-multipart>=0.0.12",
-    # MinIO nesne deposu istemcisi — SENKRON bir SDK, bu yuzden app/storage.py
-    # her cagriyi run_in_threadpool ile sarmali (ADR 0016).
-    "minio>=7.2",
 ]
 
 [project.optional-dependencies]

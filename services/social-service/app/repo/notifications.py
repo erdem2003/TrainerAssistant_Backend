@@ -1,47 +1,29 @@
-"""notifications SQL (ADR 0014, Faz S8) — doğal anahtar + UPSERT.
+"""Bildirimler (ADR 0014, Faz S8) — `social_users/{recipient}/notifications/{key}`.
 
-`app.notify.publish_notification` bu modülden ÇAĞRILMAZ: satır yazımı ve
-Redis uyandırma sinyali ayrı adımlar (router transaction'ı commit ettikten
-SONRA yayınlanır) — sebep `app/notify.py`'de.
+★ DOĞAL ANAHTAR = DOKÜMAN KİMLİĞİ ★ Postgres'teki
+`UNIQUE (recipient_id, type, actor_id, subject_id)` + `ON CONFLICT DO UPDATE`
+deseninin karşılığı: `{type}_{actor}_{subject}` kimliğine `set()` — aynı eylem
+tekrarlandığında (beğen → kaldır → beğen) TEK doküman kalır, `created_at`
+yenilenir, `read_at` SIFIRLANIR (yeni bir olay, tekrar "okunmamış").
+Bildirimin dışa görünen `id`'si de doğal anahtardan deterministik (UUIDv5):
+Postgres'te UPSERT ilk satırın `id`'sini koruyordu, sonuç aynı.
+
+★ GERÇEK ZAMANLI İLETİM ★ Redis pub/sub + chat-service WebSocket'i kalktı
+(ADR 0019 karar 5): mobil bu alt koleksiyonu Firestore snapshot dinleyicisiyle
+izliyor; doküman yazımı sinyalin KENDİSİ.
 """
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
-import asyncpg
+from google.cloud import firestore
 
-# ON CONFLICT DO UPDATE: ayni eylem TEKRARLANDIGINDA (begen->kaldir->begen)
-# TEK satir kalir, created_at guncellenir, read_at SIFIRLANIR — kullanici
-# onceden okumus olsa bile bu YENI bir olay, tekrar "okunmamis" gorunmeli.
-_UPSERT = """
-INSERT INTO notifications (id, recipient_id, type, actor_id, subject_id)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (recipient_id, type, actor_id, subject_id)
-DO UPDATE SET created_at = now(), read_at = NULL
-RETURNING id, created_at
-"""
+from app.db import db, user_doc
 
-_SELECT_PAGE = """
-SELECT n.id, n.type, n.actor_id, n.subject_id, n.created_at, n.read_at,
-       p.username AS actor_username, p.display_name AS actor_display_name,
-       p.avatar_seed AS actor_avatar_seed
-  FROM notifications n
-  LEFT JOIN social_profiles p ON p.user_id = n.actor_id
- WHERE n.recipient_id = $1 AND n.created_at < $2
- ORDER BY n.created_at DESC
- LIMIT $3
-"""
-
-_COUNT_UNREAD = "SELECT COUNT(*) FROM notifications WHERE recipient_id = $1 AND read_at IS NULL"
-
-_MARK_ALL_READ = """
-UPDATE notifications SET read_at = now() WHERE recipient_id = $1 AND read_at IS NULL
-"""
-
-_DELETE_BY_RECIPIENT = "DELETE FROM notifications WHERE recipient_id = $1"
+_ID_NAMESPACE = uuid.UUID("0b8f1f3e-5a51-4c55-9d4e-1f6f2a9c7e21")
 
 
 @dataclass(frozen=True)
@@ -50,32 +32,70 @@ class UpsertResult:
     created_at: datetime
 
 
+def _col(recipient_id: uuid.UUID):
+    return user_doc(recipient_id).collection("notifications")
+
+
+def natural_key(notification_type: str, actor_id: uuid.UUID, subject_id: uuid.UUID) -> str:
+    return f"{notification_type}_{actor_id}_{subject_id}"
+
+
 async def upsert(
-    conn: asyncpg.Connection,
     *,
-    notification_id: uuid.UUID,
     recipient_id: uuid.UUID,
     notification_type: str,
     actor_id: uuid.UUID,
     subject_id: uuid.UUID,
+    tx: firestore.AsyncTransaction | None = None,
 ) -> UpsertResult:
-    row = await conn.fetchrow(_UPSERT, notification_id, recipient_id, notification_type, actor_id, subject_id)
-    return UpsertResult(id=row["id"], created_at=row["created_at"])
+    """`tx` verilirse çağıranın transaction'ına eklenir (arkadaşlık/beğeni ile
+    atomik); verilmezse tek başına yazılır."""
+    key = natural_key(notification_type, actor_id, subject_id)
+    notification_id = uuid.uuid5(_ID_NAMESPACE, f"{recipient_id}:{key}")
+    now = datetime.now(timezone.utc)
+    data = {
+        "id": str(notification_id),
+        "type": notification_type,
+        "actor_id": str(actor_id),
+        "subject_id": str(subject_id),
+        "created_at": now,
+        "read_at": None,
+    }
+    ref = _col(recipient_id).document(key)
+    if tx is not None:
+        tx.set(ref, data)
+    else:
+        await ref.set(data)
+    return UpsertResult(id=notification_id, created_at=now)
 
 
-async def fetch_page(
-    conn: asyncpg.Connection, recipient_id: uuid.UUID, before: datetime, limit: int
-) -> list[asyncpg.Record]:
-    return await conn.fetch(_SELECT_PAGE, recipient_id, before, limit)
+async def fetch_page(recipient_id: uuid.UUID, before: datetime, limit: int) -> list[dict]:
+    query = (
+        _col(recipient_id)
+        .where(filter=firestore.FieldFilter("created_at", "<", before))
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+    )
+    return [snap.to_dict() async for snap in query.stream()]
 
 
-async def count_unread(conn: asyncpg.Connection, recipient_id: uuid.UUID) -> int:
-    return await conn.fetchval(_COUNT_UNREAD, recipient_id)
+async def count_unread(recipient_id: uuid.UUID) -> int:
+    """`count()` toplaması — 1000 indeks girdisine kadar 1 okuma."""
+    query = _col(recipient_id).where(filter=firestore.FieldFilter("read_at", "==", None))
+    result = await query.count().get()
+    return int(result[0][0].value)
 
 
-async def mark_all_read(conn: asyncpg.Connection, recipient_id: uuid.UUID) -> None:
-    await conn.execute(_MARK_ALL_READ, recipient_id)
-
-
-async def delete_by_recipient(conn: asyncpg.Connection, recipient_id: uuid.UUID) -> None:
-    await conn.execute(_DELETE_BY_RECIPIENT, recipient_id)
+async def mark_all_read(recipient_id: uuid.UUID) -> None:
+    query = _col(recipient_id).where(filter=firestore.FieldFilter("read_at", "==", None))
+    now = datetime.now(timezone.utc)
+    batch = db.client.batch()
+    pending = 0
+    async for snap in query.stream():
+        batch.update(snap.reference, {"read_at": now})
+        pending += 1
+        if pending == 400:  # yığın sınırı 500 yazım
+            await batch.commit()
+            batch, pending = db.client.batch(), 0
+    if pending:
+        await batch.commit()

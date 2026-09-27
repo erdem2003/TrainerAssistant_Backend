@@ -1,5 +1,8 @@
-"""Arkadaslik — tek kanonik satir (user_low, user_high), iki ayri istek/kabul
-satiri DEGIL. Gerekce: ADR 0014 "Sonuclar" bolumu.
+"""Arkadaşlık — tek kanonik doküman `social_friendships/{low}_{high}`, iki ayrı
+istek/kabul kaydı DEĞİL. Gerekçe: ADR 0014 "Sonuçlar" bölümü.
+
+`users: [low, high]` dizisi "bu kullanıcının tüm ilişkileri" sorgusunu tek
+alanlı `array-contains` ile karşılıyor (Postgres'teki iki ayrı indeksin yerine).
 """
 
 from __future__ import annotations
@@ -7,77 +10,21 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
-import asyncpg
+from google.cloud import firestore
+
+from nabiz_firebase import run_contended_transaction
+
+from app.db import db
 
 
 def _pair(a: uuid.UUID, b: uuid.UUID) -> tuple[uuid.UUID, uuid.UUID]:
-    """Kanonik siralama: PRIMARY KEY (user_low, user_high) CHECK (user_low < user_high)."""
+    """Kanonik sıralama — Postgres'teki CHECK (user_low < user_high)."""
     return (a, b) if str(a) < str(b) else (b, a)
 
 
-# ★ TEK UPSERT, IKI SENARYOYU BIRDEN COZUYOR ★
-# Satir yoksa PENDING olarak eklenir. Satir zaten PENDING ve FARKLI kisi
-# tarafindan istenmisse (karsilikli istek) ACCEPTED'e ceviriyoruz — iki taraf
-# da zaten istemis demektir. Bu, ayni anda iki istek atildiginda dahi TEK bir
-# satirla ve satir kilidiyle atomik olarak cozuluyor (ADR 0014, Sonuclar —
-# "aynı anda karşılıklı istek atılırsa... sonuç otomatik kabul olur").
-_UPSERT_REQUEST = """
-INSERT INTO friendships (user_low, user_high, status, requested_by)
-VALUES ($1, $2, 'PENDING', $3)
-ON CONFLICT (user_low, user_high) DO UPDATE SET
-    status = CASE
-        WHEN friendships.status = 'PENDING' AND friendships.requested_by != $3
-            THEN 'ACCEPTED'
-        ELSE friendships.status
-    END,
-    updated_at = now()
-RETURNING status, requested_by
-"""
-
-_ACCEPT = """
-UPDATE friendships
-   SET status = 'ACCEPTED', updated_at = now()
- WHERE user_low = $1 AND user_high = $2
-   AND status = 'PENDING' AND requested_by != $3
-RETURNING status
-"""
-
-_REJECT_OR_UNFRIEND = """
-DELETE FROM friendships WHERE user_low = $1 AND user_high = $2
-"""
-
-_LIST_FRIENDS = """
-SELECT CASE WHEN user_low = $1 THEN user_high ELSE user_low END AS friend_id,
-       created_at
-  FROM friendships
- WHERE (user_low = $1 OR user_high = $1) AND status = 'ACCEPTED'
- ORDER BY created_at DESC
-"""
-
-_LIST_PENDING_INCOMING = """
-SELECT CASE WHEN user_low = $1 THEN user_high ELSE user_low END AS requester_id,
-       created_at
-  FROM friendships
- WHERE (user_low = $1 OR user_high = $1) AND status = 'PENDING' AND requested_by != $1
- ORDER BY created_at DESC
-"""
-
-_LIST_PENDING_OUTGOING = """
-SELECT CASE WHEN user_low = $1 THEN user_high ELSE user_low END AS addressee_id,
-       created_at
-  FROM friendships
- WHERE (user_low = $1 OR user_high = $1) AND status = 'PENDING' AND requested_by = $1
- ORDER BY created_at DESC
-"""
-
-_ARE_FRIENDS = """
-SELECT 1 FROM friendships
- WHERE user_low = $1 AND user_high = $2 AND status = 'ACCEPTED'
-"""
-
-_DELETE_ALL_FOR_USER = """
-DELETE FROM friendships WHERE user_low = $1 OR user_high = $1
-"""
+def _ref(a: uuid.UUID, b: uuid.UUID):
+    low, high = _pair(a, b)
+    return db.collection("friendships").document(f"{low}_{high}")
 
 
 @dataclass(frozen=True)
@@ -86,46 +33,118 @@ class RequestResult:
     requested_by: uuid.UUID
 
 
-async def send_request(
-    conn: asyncpg.Connection, requester: uuid.UUID, addressee: uuid.UUID
-) -> RequestResult:
+async def send_request(requester: uuid.UUID, addressee: uuid.UUID) -> RequestResult:
+    """★ TEK TRANSACTION, İKİ SENARYO ★ Doküman yoksa PENDING açılır. Zaten
+    PENDING ve FARKLI kişi tarafından istenmişse (karşılıklı istek) ACCEPTED'e
+    çevrilir. Aynı anda iki karşılıklı istek gelse de kanonik doküman tek:
+    Firestore ikisinden birini yeniden deniyor ve ikinci deneme PENDING'i görüp
+    kabul ediyor (Postgres'teki `ON CONFLICT DO UPDATE ... CASE`)."""
+    ref = _ref(requester, addressee)
     low, high = _pair(requester, addressee)
-    row = await conn.fetchrow(_UPSERT_REQUEST, low, high, requester)
-    return RequestResult(status=row["status"], requested_by=row["requested_by"])
+
+    async def run(tx) -> tuple[str, str]:
+        snap = await ref.get(transaction=tx)
+        if not snap.exists:
+            tx.set(ref, {
+                "user_low": str(low),
+                "user_high": str(high),
+                "users": [str(low), str(high)],
+                "status": "PENDING",
+                "requested_by": str(requester),
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            })
+            return "PENDING", str(requester)
+        data = snap.to_dict()
+        status, requested_by = data["status"], data["requested_by"]
+        if status == "PENDING" and requested_by != str(requester):
+            status = "ACCEPTED"
+        tx.update(ref, {"status": status, "updated_at": firestore.SERVER_TIMESTAMP})
+        return status, requested_by
+
+    status, requested_by = await run_contended_transaction(run)
+    return RequestResult(status=status, requested_by=uuid.UUID(requested_by))
 
 
-async def accept(conn: asyncpg.Connection, me: uuid.UUID, requester_id: uuid.UUID) -> bool:
-    low, high = _pair(me, requester_id)
-    row = await conn.fetchrow(_ACCEPT, low, high, me)
-    return row is not None
+async def accept(me: uuid.UUID, requester_id: uuid.UUID) -> bool:
+    """Yalnızca BAŞKASININ bana gönderdiği bekleyen isteği kabul eder."""
+    ref = _ref(me, requester_id)
+
+    @firestore.async_transactional
+    async def run(tx) -> bool:
+        snap = await ref.get(transaction=tx)
+        if not snap.exists:
+            return False
+        data = snap.to_dict()
+        if data["status"] != "PENDING" or data["requested_by"] == str(me):
+            return False
+        tx.update(ref, {"status": "ACCEPTED", "updated_at": firestore.SERVER_TIMESTAMP})
+        return True
+
+    return await run(db.client.transaction())
 
 
-async def reject_or_unfriend(conn: asyncpg.Connection, a: uuid.UUID, b: uuid.UUID) -> None:
-    low, high = _pair(a, b)
-    await conn.execute(_REJECT_OR_UNFRIEND, low, high)
+async def reject_or_unfriend(a: uuid.UUID, b: uuid.UUID) -> None:
+    await _ref(a, b).delete()
 
 
-async def list_friends(conn: asyncpg.Connection, user_id: uuid.UUID) -> list[dict]:
-    rows = await conn.fetch(_LIST_FRIENDS, user_id)
-    return [dict(r) for r in rows]
+async def _all_for(user_id: uuid.UUID) -> list[dict]:
+    query = db.collection("friendships").where(
+        filter=firestore.FieldFilter("users", "array_contains", str(user_id))
+    )
+    return [snap.to_dict() async for snap in query.stream()]
 
 
-async def list_pending_incoming(conn: asyncpg.Connection, user_id: uuid.UUID) -> list[dict]:
-    rows = await conn.fetch(_LIST_PENDING_INCOMING, user_id)
-    return [dict(r) for r in rows]
+def _other(row: dict, user_id: uuid.UUID) -> uuid.UUID:
+    return uuid.UUID(row["user_high"] if row["user_low"] == str(user_id) else row["user_low"])
 
 
-async def list_pending_outgoing(conn: asyncpg.Connection, user_id: uuid.UUID) -> list[dict]:
-    rows = await conn.fetch(_LIST_PENDING_OUTGOING, user_id)
-    return [dict(r) for r in rows]
+def _newest_first(rows: list[dict]) -> list[dict]:
+    return sorted(rows, key=lambda r: r["created_at"], reverse=True)
 
 
-async def are_friends(conn: asyncpg.Connection, a: uuid.UUID, b: uuid.UUID) -> bool:
-    low, high = _pair(a, b)
-    row = await conn.fetchrow(_ARE_FRIENDS, low, high)
-    return row is not None
+async def list_friends(user_id: uuid.UUID) -> list[dict]:
+    rows = [r for r in await _all_for(user_id) if r["status"] == "ACCEPTED"]
+    return [{"friend_id": _other(r, user_id), "created_at": r["created_at"]} for r in _newest_first(rows)]
 
 
-async def delete_all_for_user(conn: asyncpg.Connection, user_id: uuid.UUID) -> int:
-    result = await conn.execute(_DELETE_ALL_FOR_USER, user_id)
-    return int(result.split()[-1])
+async def list_pending(user_id: uuid.UUID) -> tuple[list[dict], list[dict]]:
+    """(gelen, giden) — tek sorgudan ikisi birden (Postgres'te iki sorguydu)."""
+    incoming, outgoing = [], []
+    for r in _newest_first([r for r in await _all_for(user_id) if r["status"] == "PENDING"]):
+        other = _other(r, user_id)
+        if r["requested_by"] == str(user_id):
+            outgoing.append({"addressee_id": other, "created_at": r["created_at"]})
+        else:
+            incoming.append({"requester_id": other, "created_at": r["created_at"]})
+    return incoming, outgoing
+
+
+async def are_friends(a: uuid.UUID, b: uuid.UUID) -> bool:
+    snap = await _ref(a, b).get()
+    return snap.exists and snap.get("status") == "ACCEPTED"
+
+
+async def statuses_with(viewer_id: uuid.UUID, others: list[uuid.UUID]) -> dict[uuid.UUID, tuple[str, uuid.UUID]]:
+    """Arama sonucu için ilişki durumları — `other -> (status, requested_by)`.
+    Postgres'teki LEFT JOIN'in karşılığı: toplu kimlik okuması."""
+    if not others:
+        return {}
+    refs = {_ref(viewer_id, o).id: o for o in others}
+    result = {}
+    async for snap in db.client.get_all([db.collection("friendships").document(i) for i in refs]):
+        if snap.exists:
+            data = snap.to_dict()
+            result[refs[snap.id]] = (data["status"], uuid.UUID(data["requested_by"]))
+    return result
+
+
+async def delete_all_for_user(user_id: uuid.UUID) -> int:
+    query = db.collection("friendships").where(
+        filter=firestore.FieldFilter("users", "array_contains", str(user_id))
+    )
+    count = 0
+    async for snap in query.stream():
+        await snap.reference.delete()
+        count += 1
+    return count

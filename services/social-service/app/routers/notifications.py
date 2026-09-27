@@ -1,21 +1,23 @@
 """GET /v1/social/notifications, POST .../read (ADR 0014, Faz S8).
 
-Üretim (satır yazımı) `friendships.py`/`posts.py` router'larında — bu dosya
-yalnızca okuma ve okundu işaretleme.
+Üretim (doküman yazımı) `friendships.py`/`posts.py`/`challenges.py`
+router'larında — bu dosya yalnızca okuma ve okundu işaretleme. Mobil aynı
+alt koleksiyonu (`social_users/{uid}/notifications`) Firestore dinleyicisiyle
+de izleyebiliyor; bu uç sayfalı geçmiş ve okunmamış sayısı için duruyor.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Header, Query, status
 
-from app.db import db
 from app.errors import unprocessable
 from app.identity import require_user_id
-from app.repo import notifications
+from app.repo import notifications, profiles
 from app.schemas import NotificationActorOut, NotificationOut, NotificationPage
 
 router = APIRouter(prefix="/v1/social/notifications", tags=["notifications"])
@@ -51,29 +53,34 @@ async def list_notifications(
     user_id = require_user_id(x_user_id)
     before = _decode_cursor(cursor)
 
-    async with db.pool.acquire() as conn:
-        rows = await notifications.fetch_page(conn, user_id, before, limit + 1)
-        unread = await notifications.count_unread(conn, user_id)
+    rows = await notifications.fetch_page(user_id, before, limit + 1)
+    unread = await notifications.count_unread(user_id)
 
     has_more = len(rows) > limit
     rows = rows[:limit]
 
-    items = [
-        NotificationOut(
-            id=str(r["id"]),
-            type=r["type"],
-            actor=NotificationActorOut(
-                user_id=str(r["actor_id"]),
-                username=r["actor_username"],
-                display_name=r["actor_display_name"],
-                avatar_seed=r["actor_avatar_seed"],
-            ),
-            subject_id=str(r["subject_id"]),
-            created_at=_epoch_ms(r["created_at"]),
-            read=r["read_at"] is not None,
+    # LEFT JOIN semantiği: silinmiş aktör "Silinmiş kullanıcı" olarak (alanlar
+    # boş) gösteriliyor — `NotificationActorOut`'un alanları opsiyonel.
+    actors = await profiles.profiles_map(uuid.UUID(r["actor_id"]) for r in rows)
+
+    items = []
+    for r in rows:
+        actor = actors.get(uuid.UUID(r["actor_id"]))
+        items.append(
+            NotificationOut(
+                id=r["id"],
+                type=r["type"],
+                actor=NotificationActorOut(
+                    user_id=r["actor_id"],
+                    username=actor.username if actor else None,
+                    display_name=actor.display_name if actor else None,
+                    avatar_seed=actor.avatar_seed if actor else None,
+                ),
+                subject_id=r["subject_id"],
+                created_at=_epoch_ms(r["created_at"]),
+                read=r.get("read_at") is not None,
+            )
         )
-        for r in rows
-    ]
 
     next_cursor = _encode_cursor(rows[-1]["created_at"]) if has_more and rows else None
     return NotificationPage(items=items, unread_count=unread, next_cursor=next_cursor)
@@ -85,5 +92,4 @@ async def mark_all_read(x_user_id: str | None = Header(default=None)) -> None:
     desteklemiyor (bildirim listesi ekranı açıldığında tek çağrı yeterli)."""
     user_id = require_user_id(x_user_id)
 
-    async with db.pool.acquire() as conn:
-        await notifications.mark_all_read(conn, user_id)
+    await notifications.mark_all_read(user_id)

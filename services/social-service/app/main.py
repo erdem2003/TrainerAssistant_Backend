@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -16,11 +17,11 @@ from app.correlation import (
     configure_logging,
     current_correlation_id,
 )
-from app import notify
 from app.db import db
 from app.ratelimit import limiter
 from app.errors import ApiError, api_error_handler, unhandled_error_handler
 from app.routers import challenges, friendships, health, internal, leaderboards, notifications, posts, profiles
+from app.worker import workout_consumer
 
 logger = logging.getLogger(__name__)
 
@@ -29,17 +30,19 @@ logger = logging.getLogger(__name__)
 async def lifespan(_: FastAPI):
     configure_logging(settings.log_level)
     await db.connect()
-    # Migration açılışta koşuyor. Ayrı bir komut olsaydı "önce migrate et, sonra
-    # başlat" sırasını herkesin hatırlaması gerekirdi; unutulduğunda hata
-    # veritabanı seviyesinde ve anlaşılmaz çıkar.
     await db.migrate()
     await limiter.connect()
+    # Ayrı `social-consumer` Kafka süreci yerine süreç içi dağıtıcıya abonelik
+    # + bekleyen gönderi süpürücüsü (ADR 0019 karar 2).
+    workout_consumer.register()
+    sweep_task = asyncio.create_task(workout_consumer.sweep_stale_posts_loop())
     logger.info("%s hazır", settings.service_name)
     try:
         yield
     finally:
+        sweep_task.cancel()
+        workout_consumer.unregister()
         await limiter.close()
-        await notify.close()
         await db.close()
 
 app = FastAPI(

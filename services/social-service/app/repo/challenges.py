@@ -1,78 +1,26 @@
-"""challenges / challenge_participants / workout_kudos SQL (ADR 0014, Faz S9).
+"""Meydan okuma + kudos (ADR 0014, Faz S9).
 
-İlerleme burada HESAPLANMAZ — yalnızca hedef/katılımcı satırları. İlerleme
-sorgusu `app/routers/challenges.py`'de `workout_snapshots`'a karşı çalışır.
+    social_challenges/{id}                 hedef + `participant_ids` dizisi
+    social_kudos/{workout_id}_{giver_id}   (workout_id, giver_id) UNIQUE'in karşılığı
+
+İlerleme burada SAKLANMAZ — her sorguda katılımcıların snapshot'larından
+hesaplanır (`fetch_progress`). Katılımcılar ayrı koleksiyon değil dizi: bir
+meydan okuma arkadaş çevresiyle sınırlı (onlarca kişi), `array-contains` ile
+"katıldığım meydan okumalar" tek alanlı indeksle sorgulanıyor.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
-import asyncpg
+from google.api_core.exceptions import AlreadyExists
+from google.cloud import firestore
 
-_INSERT_CHALLENGE = """
-INSERT INTO challenges (id, creator_id, title, exercise_id, target_reps, starts_at, ends_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-"""
-
-_FIND_BY_ID = """
-SELECT id, creator_id, title, exercise_id, target_reps, starts_at, ends_at, created_at
-  FROM challenges WHERE id = $1
-"""
-
-_INSERT_PARTICIPANT = """
-INSERT INTO challenge_participants (challenge_id, user_id) VALUES ($1, $2)
-ON CONFLICT (challenge_id, user_id) DO NOTHING
-"""
-
-_IS_PARTICIPANT = "SELECT 1 FROM challenge_participants WHERE challenge_id = $1 AND user_id = $2"
-
-# Kullanıcının katıldığı TÜM meydan okumalar — bitmiş olanlar da dahil
-# (geçmişte kalan bir hedefi tamamlayıp tamamlamadığını görmek istenir).
-_SELECT_FOR_USER = """
-SELECT c.id, c.creator_id, c.title, c.exercise_id, c.target_reps, c.starts_at, c.ends_at, c.created_at
-  FROM challenges c
-  JOIN challenge_participants cp ON cp.challenge_id = c.id
- WHERE cp.user_id = $1
- ORDER BY c.ends_at DESC
-"""
-
-_SELECT_PARTICIPANTS = """
-SELECT cp.user_id, p.username, p.display_name, p.avatar_seed
-  FROM challenge_participants cp
-  LEFT JOIN social_profiles p ON p.user_id = cp.user_id
- WHERE cp.challenge_id = $1
-"""
-
-# İlerleme: katılımcı başına, hedef egzersize (varsa) ve tarih aralığına göre
-# `workout_snapshots` toplamı. `exercise_id IS NULL` ise egzersiz filtresi yok.
-_SELECT_PROGRESS = """
-SELECT user_id, COALESCE(SUM(total_reps), 0) AS reps
-  FROM workout_snapshots
- WHERE user_id = ANY($1::uuid[])
-   AND started_at >= $2 AND started_at < $3
-   AND ($4::text IS NULL OR exercise_id = $4)
- GROUP BY user_id
-"""
-
-_DELETE_PARTICIPANT_BY_USER = "DELETE FROM challenge_participants WHERE user_id = $1"
-_DELETE_CHALLENGES_BY_CREATOR = "DELETE FROM challenges WHERE creator_id = $1"
-
-_UPSERT_KUDOS = """
-INSERT INTO workout_kudos (workout_id, giver_id) VALUES ($1, $2)
-ON CONFLICT (workout_id, giver_id) DO NOTHING
-RETURNING workout_id
-"""
-
-_DELETE_KUDOS = "DELETE FROM workout_kudos WHERE workout_id = $1 AND giver_id = $2"
-
-_COUNT_KUDOS = "SELECT COUNT(*) FROM workout_kudos WHERE workout_id = $1"
-
-_HAS_KUDOS = "SELECT 1 FROM workout_kudos WHERE workout_id = $1 AND giver_id = $2"
-
-_DELETE_KUDOS_BY_GIVER = "DELETE FROM workout_kudos WHERE giver_id = $1"
+from app.db import db
+from app.repo import profiles, snapshots
 
 
 @dataclass(frozen=True)
@@ -85,10 +33,33 @@ class Challenge:
     starts_at: datetime
     ends_at: datetime
     created_at: datetime
+    participant_ids: tuple[uuid.UUID, ...] = ()
+
+
+def _col():
+    return db.collection("challenges")
+
+
+def _kudos():
+    return db.collection("kudos")
+
+
+def _to_challenge(snap) -> Challenge:
+    d = snap.to_dict()
+    return Challenge(
+        id=uuid.UUID(snap.id),
+        creator_id=uuid.UUID(d["creator_id"]),
+        title=d["title"],
+        exercise_id=d.get("exercise_id"),
+        target_reps=int(d["target_reps"]),
+        starts_at=d["starts_at"],
+        ends_at=d["ends_at"],
+        created_at=d["created_at"],
+        participant_ids=tuple(uuid.UUID(p) for p in d.get("participant_ids") or []),
+    )
 
 
 async def create(
-    conn: asyncpg.Connection,
     *,
     challenge_id: uuid.UUID,
     creator_id: uuid.UUID,
@@ -97,67 +68,112 @@ async def create(
     target_reps: int,
     starts_at: datetime,
     ends_at: datetime,
-) -> None:
-    await conn.execute(
-        _INSERT_CHALLENGE, challenge_id, creator_id, title, exercise_id, target_reps, starts_at, ends_at
-    )
-    await conn.execute(_INSERT_PARTICIPANT, challenge_id, creator_id)
+) -> bool:
+    """Oluşturur, kurucuyu katılımcı yapar. Kimlik zaten varsa `False`."""
+    try:
+        await _col().document(str(challenge_id)).create({
+            "creator_id": str(creator_id),
+            "title": title,
+            "exercise_id": exercise_id,
+            "target_reps": target_reps,
+            "starts_at": starts_at,
+            "ends_at": ends_at,
+            "created_at": datetime.now(timezone.utc),
+            "participant_ids": [str(creator_id)],
+        })
+        return True
+    except AlreadyExists:
+        return False
 
 
-async def find_by_id(conn: asyncpg.Connection, challenge_id: uuid.UUID) -> Challenge | None:
-    row = await conn.fetchrow(_FIND_BY_ID, challenge_id)
-    return Challenge(**dict(row)) if row else None
+async def find_by_id(challenge_id: uuid.UUID) -> Challenge | None:
+    snap = await _col().document(str(challenge_id)).get()
+    return _to_challenge(snap) if snap.exists else None
 
 
-async def join(conn: asyncpg.Connection, challenge_id: uuid.UUID, user_id: uuid.UUID) -> None:
-    await conn.execute(_INSERT_PARTICIPANT, challenge_id, user_id)
+async def join(challenge_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    """`ArrayUnion` idempotent — ON CONFLICT DO NOTHING'in karşılığı."""
+    await _col().document(str(challenge_id)).update({"participant_ids": firestore.ArrayUnion([str(user_id)])})
 
 
-async def is_participant(conn: asyncpg.Connection, challenge_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    return await conn.fetchval(_IS_PARTICIPANT, challenge_id, user_id) is not None
+async def list_for_user(user_id: uuid.UUID) -> list[Challenge]:
+    """Katıldığı TÜM meydan okumalar (bitmişler dahil), bitişe göre yeniden eskiye."""
+    query = _col().where(filter=firestore.FieldFilter("participant_ids", "array_contains", str(user_id)))
+    items = [_to_challenge(s) async for s in query.stream()]
+    return sorted(items, key=lambda c: c.ends_at, reverse=True)
 
 
-async def list_for_user(conn: asyncpg.Connection, user_id: uuid.UUID) -> list[Challenge]:
-    rows = await conn.fetch(_SELECT_FOR_USER, user_id)
-    return [Challenge(**dict(r)) for r in rows]
-
-
-async def list_participants(conn: asyncpg.Connection, challenge_id: uuid.UUID) -> list[asyncpg.Record]:
-    return await conn.fetch(_SELECT_PARTICIPANTS, challenge_id)
+async def list_participants(challenge: Challenge) -> list[dict]:
+    """Katılımcı + profil (LEFT JOIN: profili silinmiş katılımcı adsız döner)."""
+    by_id = await profiles.profiles_map(challenge.participant_ids)
+    rows = []
+    for uid in challenge.participant_ids:
+        p = by_id.get(uid)
+        rows.append({
+            "user_id": uid,
+            "username": p.username if p else None,
+            "display_name": p.display_name if p else None,
+            "avatar_seed": p.avatar_seed if p else None,
+        })
+    return rows
 
 
 async def fetch_progress(
-    conn: asyncpg.Connection,
     user_ids: list[uuid.UUID],
     starts_at: datetime,
     ends_at: datetime,
     exercise_id: str | None,
 ) -> dict[uuid.UUID, int]:
-    rows = await conn.fetch(_SELECT_PROGRESS, user_ids, starts_at, ends_at, exercise_id)
-    return {r["user_id"]: r["reps"] for r in rows}
+    """Katılımcı başına aralıktaki tekrar toplamı; `exercise_id` None ise
+    egzersiz filtresi yok. Egzersiz filtresi bellekte (bileşik indeks olmasın)."""
+    per_user = await asyncio.gather(*(snapshots.fetch_between(u, starts_at, ends_at) for u in user_ids))
+    result = {}
+    for user_id, snaps in zip(user_ids, per_user):
+        reps = sum(int(s.get("total_reps", 0)) for s in snaps
+                   if exercise_id is None or s.get("exercise_id") == exercise_id)
+        if snaps:
+            result[user_id] = reps
+    return result
 
 
-async def delete_for_user(conn: asyncpg.Connection, user_id: uuid.UUID) -> None:
-    await conn.execute(_DELETE_PARTICIPANT_BY_USER, user_id)
-    await conn.execute(_DELETE_CHALLENGES_BY_CREATOR, user_id)
+async def delete_for_user(user_id: uuid.UUID) -> None:
+    uid = str(user_id)
+    async for snap in _col().where(filter=firestore.FieldFilter("participant_ids", "array_contains", uid)).stream():
+        if snap.get("creator_id") == uid:
+            await snap.reference.delete()
+        else:
+            await snap.reference.update({"participant_ids": firestore.ArrayRemove([uid])})
+    async for snap in _col().where(filter=firestore.FieldFilter("creator_id", "==", uid)).stream():
+        await snap.reference.delete()
 
 
-async def give_kudos(conn: asyncpg.Connection, workout_id: uuid.UUID, giver_id: uuid.UUID) -> bool:
-    row = await conn.fetchrow(_UPSERT_KUDOS, workout_id, giver_id)
-    return row is not None
+# --- Kudos ---------------------------------------------------------------------
 
 
-async def remove_kudos(conn: asyncpg.Connection, workout_id: uuid.UUID, giver_id: uuid.UUID) -> None:
-    await conn.execute(_DELETE_KUDOS, workout_id, giver_id)
+async def give_kudos(workout_id: uuid.UUID, giver_id: uuid.UUID) -> bool:
+    """Yeni ise `True` — `create()` ikinci kez AlreadyExists fırlatır."""
+    try:
+        await _kudos().document(f"{workout_id}_{giver_id}").create(
+            {"workout_id": str(workout_id), "giver_id": str(giver_id), "created_at": firestore.SERVER_TIMESTAMP}
+        )
+        return True
+    except AlreadyExists:
+        return False
 
 
-async def count_kudos(conn: asyncpg.Connection, workout_id: uuid.UUID) -> int:
-    return await conn.fetchval(_COUNT_KUDOS, workout_id)
+async def remove_kudos(workout_id: uuid.UUID, giver_id: uuid.UUID) -> None:
+    await _kudos().document(f"{workout_id}_{giver_id}").delete()
 
 
-async def has_kudos(conn: asyncpg.Connection, workout_id: uuid.UUID, giver_id: uuid.UUID) -> bool:
-    return await conn.fetchval(_HAS_KUDOS, workout_id, giver_id) is not None
+async def count_kudos(workout_id: uuid.UUID) -> int:
+    result = await _kudos().where(filter=firestore.FieldFilter("workout_id", "==", str(workout_id))).count().get()
+    return int(result[0][0].value)
 
 
-async def delete_kudos_by_giver(conn: asyncpg.Connection, giver_id: uuid.UUID) -> None:
-    await conn.execute(_DELETE_KUDOS_BY_GIVER, giver_id)
+async def has_kudos(workout_id: uuid.UUID, giver_id: uuid.UUID) -> bool:
+    return (await _kudos().document(f"{workout_id}_{giver_id}").get()).exists
+
+
+async def delete_kudos_by_giver(giver_id: uuid.UUID) -> None:
+    async for snap in _kudos().where(filter=firestore.FieldFilter("giver_id", "==", str(giver_id))).stream():
+        await snap.reference.delete()
