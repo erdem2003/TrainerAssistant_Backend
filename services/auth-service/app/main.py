@@ -18,8 +18,9 @@ from app.correlation import (
 )
 from app.db import db
 from app.errors import ApiError, api_error_handler, unhandled_error_handler
-from app.ratelimit import limiter
-from app.routers import account, health, identity, password, registrations, sessions
+# ADR 0019: `registrations`, `sessions`, `password` router'lari kalkti — kayit,
+# giris, token yenileme, dogrulama kodu ve parola sifirlama Firebase Auth'ta.
+from app.routers import account, health, identity
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +33,10 @@ async def lifespan(_: FastAPI):
     # o zaman "önce migrate et, sonra başlat" sırasını herkesin hatırlaması
     # gerekir; unutulduğunda hata veritabanı seviyesinde ve anlaşılmaz çıkar.
     await db.migrate()
-    await limiter.connect()
     logger.info("%s hazır", settings.service_name)
     try:
         yield
     finally:
-        await limiter.close()
         await db.close()
 
 app = FastAPI(
@@ -79,7 +78,4 @@ async def validation_handler(_: Request, exc: RequestValidationError) -> JSONRes
 
 app.include_router(health.router)
 app.include_router(identity.router)
-app.include_router(registrations.router)
-app.include_router(sessions.router)
-app.include_router(password.router)
 app.include_router(account.router)

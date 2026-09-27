@@ -4,19 +4,16 @@ version = "1.0.0"
 description = "AI Fitness Coach - kimlik dogrulama servisi"
 requires-python = ">=3.12"
 
+# ADR 0019: kimlik Firebase Auth'ta — bcrypt / pyjwt / email-validator /
+# redis / asyncpg kalkti. Kalan is: UUID<->uid eslemesi, /me, hesap silme
+# fan-out'u (urllib, standart kutuphane) ve Firebase kullanicisinin silinmesi.
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    # asyncpg: ORM yok, ham SQL. Sorgular gozden gecirilebilir olsun diye.
-    "asyncpg>=0.30",
+    "google-cloud-firestore>=2.19",
+    "firebase-admin>=6.6",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
-    "email-validator>=2.2",
-    "bcrypt>=4.2",
-    # RS256 icin cryptography gerekli.
-    "pyjwt[crypto]>=2.10",
-    "redis>=5.2",
-    # E-posta: smtplib STANDART KUTUPHANE, ek bagimlilik yok.
 ]
 
 [project.optional-dependencies]
