@@ -1,4 +1,4 @@
-"""Ortam degiskenleri: veritabani, Redis ve soket omru ayarlari."""
+"""Ortam degiskenleri: social-service adresi ve soket omru ayarlari (ADR 0019)."""
 
 from __future__ import annotations
 
@@ -13,34 +13,18 @@ class Settings(BaseSettings):
     service_name: str = "chat-service"
     log_level: str = "INFO"
 
-    database_url: str = "postgresql://trainer:trainer@localhost:15433/chat_db"
-    db_pool_min: int = 2
-    db_pool_max: int = 10
-
     # `DELETE /internal/users/{id}` ucunu koruyan paylaşılan sır.
     internal_api_key: str = ""
 
-    # Sosyal bildirimlerin ve coklu-ornek dagitiminin surecler-arasi koprusu
-    # (ADR 0014, "Redis pub/sub"). Redis zaten ayakta — auth-service hiz
-    # sinirlamasi icin kullaniyor.
-    redis_url: str = "redis://redis:6379/0"
-
-    # ★ TEK SENKRON CAGRI NOKTASI ★ Arkadaslik/kullanici adi `social_db`'de
-    # (ADR 0005), chat_db'de degil. Mesaj gonderirken yazma yetkisi (arkadas
-    # mi), konusma listesinde ad gosterirken de profil bilgisi icin
-    # `social-service/app/routers/internal.py`'deki iki uc cagrilir (Faz S6).
+    # ★ TEK SENKRON CAGRI NOKTASI ★ Arkadaslik/kullanici adi social-service'te
+    # (ADR 0005). Mesaj gonderirken yazma yetkisi (arkadas mi), konusma
+    # listesinde ad gosterirken profil bilgisi icin iki ic uc cagrilir.
+    # Tek surecli dagitimda `social_client.use_transport()` ile ag atlanabilir.
     social_service_url: str = "http://social-service:8000"
 
-    # ★ SOKET OMRU UST SINIRI ★
-    # `X-Token-Exp`'in kendisi zaten bir ust sinir sagliyor (erisim token'i
-    # ~15 dk), ama bu sabit ikinci bir guvenlik agi: gateway'den beklenmeyen
-    # bir deger gelirse (ornegin bos/hatali basaligi) soket YINE DE sonsuza
-    # kadar acik kalmaz.
+    # ★ SOKET OMRU UST SINIRI ★ (`/ws` — artik yalnizca canli ortak antrenman
+    # rolesi icin; sohbet ve bildirimler Firestore dinleyicisinde.)
     ws_max_lifetime_seconds: int = 4 * 60 * 60
-
-    # Istemcinin pingInterval'i (30s) ile uyumlu; iki kacirilmis ping sonrasi
-    # olu baglanti sayilir (gateway `/ws` location'indaki proxy_read_timeout
-    # 75s ile ayni gerekce).
     ws_idle_timeout_seconds: int = 75
 
 

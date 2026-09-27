@@ -1,22 +1,23 @@
 """Konuşma listesi, mesaj gönderme/okuma, okundu işaretleme (ADR 0014, Faz S6).
 
-Yazma HER ZAMAN buradan (HTTP) — soket yalnızca ALICI (`app/hub.py`,
-`app/routers/realtime.py`). Arkadaşlık/profil `social_db`'de yaşadığı için
-yazma yetkisi ve görüntü verisi `app/social_client.py` üzerinden senkron
-çağrıyla geliyor (ADR 0005'in izin verdiği minimum istisna).
+Yazma HER ZAMAN buradan (HTTP). Okuma iki yoldan: bu uçlar (sayfalı geçmiş,
+liste) ve mobilin Firestore dinleyicisi (`chat_conversations/{id}` +
+`messages` alt koleksiyonu — ADR 0019 karar 5). Redis/WebSocket üzerinden
+MESSAGE/RECEIPT çerçevesi artık gönderilmiyor: yazılan doküman sinyalin kendisi.
+
+Arkadaşlık/profil social-service'te yaşadığı için yazma yetkisi ve görüntü
+verisi `app/social_client.py` üzerinden geliyor (ADR 0005'in izin verdiği
+minimum senkron istisna).
 """
 
 from __future__ import annotations
 
-import time
 import uuid
 
 from fastapi import APIRouter, Header, Query, Response, status
 
 from app import social_client
-from app.db import db
 from app.errors import conflict, not_found, unprocessable
-from app.hub import hub
 from app.identity import require_user_id
 from app.repo import conversations, messages
 from app.schemas import (
@@ -34,6 +35,7 @@ router = APIRouter(prefix="/v1/chat", tags=["chat"])
 
 _MESSAGES_LIMIT_DEFAULT = 30
 _MESSAGES_LIMIT_MAX = 100
+
 _UNKNOWN_PEER = PeerOut(user_id="", username="", display_name="Bilinmeyen kullanıcı", avatar_seed="")
 
 
@@ -48,11 +50,11 @@ def _epoch_ms(dt) -> int | None:
     return int(dt.timestamp() * 1000) if dt is not None else None
 
 
-async def _require_participant(conn, conversation_id: uuid.UUID, user_id: uuid.UUID):
-    participant = await conversations.find_participant(conn, conversation_id, user_id)
-    if participant is None:
+async def _require_participant(conversation_id: uuid.UUID, user_id: uuid.UUID) -> dict:
+    conversation = await conversations.find(conversation_id)
+    if not conversations.is_participant(conversation, user_id):
         raise not_found("Konuşma bulunamadı")
-    return participant
+    return conversation
 
 
 def _peer_out(profile: social_client.ProfileSummary | None) -> PeerOut:
@@ -86,18 +88,17 @@ async def create_conversation(
 ) -> ConversationOut:
     me = require_user_id(x_user_id)
     peer_id = _parse_uuid(body.peer_user_id)
-
     if peer_id == me:
         raise unprocessable("kendinle konuşma açamazsın")
 
     if not await social_client.are_friends(me, peer_id):
         raise not_found("Kullanıcı bulunamadı")
 
-    async with db.pool.acquire() as conn:
-        conversation_id = await conversations.get_or_create(conn, me, peer_id)
+    conversation_id = await conversations.get_or_create(me, peer_id)
 
     profiles = await social_client.fetch_profiles([peer_id])
     peer_profile = profiles.get(str(peer_id))
+
     response.status_code = status.HTTP_200_OK  # get-or-create: her zaman idempotent 200 anlamına gelir
     return ConversationOut(
         id=str(conversation_id),
@@ -114,11 +115,9 @@ async def create_conversation(
 async def list_conversations(x_user_id: str | None = Header(default=None)) -> ConversationListOut:
     me = require_user_id(x_user_id)
 
-    async with db.pool.acquire() as conn:
-        rows = await conversations.list_for_user(conn, me)
+    rows = await conversations.list_for_user(me)
 
-    peer_ids = [r.peer_id for r in rows]
-    profiles = await social_client.fetch_profiles(peer_ids)
+    profiles = await social_client.fetch_profiles([r.peer_id for r in rows])
 
     items = []
     for r in rows:
@@ -128,12 +127,13 @@ async def list_conversations(x_user_id: str | None = Header(default=None)) -> Co
                 id=str(r.conversation_id),
                 peer=_peer_out(peer_profile),
                 unread_count=r.unread_count,
-                last_message=None if r.last_redacted_at is not None else r.last_body,
+                last_message=None if r.last_redacted else r.last_body,
                 last_message_from_me=(r.last_sender_id == me) if r.last_sender_id else False,
-                last_message_redacted=r.last_redacted_at is not None,
+                last_message_redacted=r.last_redacted,
                 last_message_at=_epoch_ms(r.last_created_at),
             )
         )
+
     return ConversationListOut(items=items)
 
 
@@ -148,17 +148,16 @@ async def list_messages(
     cid = _parse_uuid(conversation_id)
     cursor = before_seq if before_seq is not None else 2**31 - 1
 
-    async with db.pool.acquire() as conn:
-        await _require_participant(conn, cid, me)
-        page = await messages.fetch_page(conn, cid, cursor, limit + 1)
+    await _require_participant(cid, me)
+    page = await messages.fetch_page(cid, cursor, limit + 1)
 
     # DESC sorgulanıp ASC'e çevrildiği için "daha eski var mı" en BAŞTAKİ
     # (en eski) satırın fazlalık olup olmadığına bakılarak anlaşılır.
     has_more = len(page) > limit
     if has_more:
         page = page[1:]
-
     next_before_seq = page[0].seq if has_more and page else None
+
     return MessagePage(items=[_message_to_out(m) for m in page], next_before_seq=next_before_seq)
 
 
@@ -179,48 +178,32 @@ async def send_message(
     message_id = _parse_uuid(body.id)
     incoming_hash = body.content_hash()
 
-    async with db.pool.acquire() as conn:
-        await _require_participant(conn, cid, sender_id)
+    conversation = await _require_participant(cid, sender_id)
 
-        existing = await messages.find_by_id(conn, message_id)
-        if existing is not None:
-            if existing.conversation_id != cid or existing.sender_id != sender_id:
-                raise not_found("Mesaj bulunamadı")
-            if existing.content_hash != incoming_hash:
-                raise conflict("Bu mesaj id'si farklı bir içerikle zaten kayıtlı", {"message_id": body.id})
-            response.status_code = status.HTTP_200_OK
-            return _message_to_out(existing)
-
-        peer_id = await conversations.find_peer(conn, cid, sender_id)
+    existing = await messages.find_by_id(cid, message_id)
+    if existing is None:
+        peer_id = conversations.peer_of(conversation, sender_id)
         if peer_id is None:
             raise not_found("Konuşma bulunamadı")
-
         if not await social_client.are_friends(sender_id, peer_id):
             raise unprocessable("Artık arkadaş değilsiniz, mesaj gönderemezsin")
+        message, created = await messages.insert(
+            message_id=message_id,
+            conversation_id=cid,
+            sender_id=sender_id,
+            body=body.body,
+            content_hash=incoming_hash,
+        )
+        if created:
+            return _message_to_out(message)
+        existing = message  # eşzamanlı idempotent tekrar yarışı kaybetti
 
-        async with conn.transaction():
-            message = await messages.insert(
-                conn,
-                message_id=message_id,
-                conversation_id=cid,
-                sender_id=sender_id,
-                body=body.body,
-                content_hash=incoming_hash,
-            )
-
-    await hub.publish(
-        peer_id,
-        {
-            "type": "MESSAGE",
-            "conversation_id": str(cid),
-            "id": str(message.id),
-            "seq": message.seq,
-            "sender_id": str(sender_id),
-            "body": message.body,
-            "created_at": _epoch_ms(message.created_at),
-        },
-    )
-    return _message_to_out(message)
+    if existing.sender_id != sender_id:
+        raise not_found("Mesaj bulunamadı")
+    if existing.content_hash != incoming_hash:
+        raise conflict("Bu mesaj id'si farklı bir içerikle zaten kayıtlı", {"message_id": body.id})
+    response.status_code = status.HTTP_200_OK
+    return _message_to_out(existing)
 
 
 @router.post("/conversations/{conversation_id}/read", status_code=status.HTTP_204_NO_CONTENT)
@@ -229,22 +212,10 @@ async def mark_read(
     body: MarkReadIn,
     x_user_id: str | None = Header(default=None),
 ) -> None:
+    """Okundu bilgisi konuşma dokümanında (`reads.{uid}.last_read_seq`) —
+    karşı taraf onu dinleyiciyle görüyor (eski RECEIPT çerçevesinin yerine)."""
     me = require_user_id(x_user_id)
     cid = _parse_uuid(conversation_id)
 
-    async with db.pool.acquire() as conn:
-        await _require_participant(conn, cid, me)
-        await conversations.mark_read(conn, cid, me, body.up_to_seq)
-        peer_id = await conversations.find_peer(conn, cid, me)
-
-    if peer_id is not None:
-        await hub.publish(
-            peer_id,
-            {
-                "type": "RECEIPT",
-                "conversation_id": str(cid),
-                "reader_id": str(me),
-                "up_to_seq": body.up_to_seq,
-                "server_time": int(time.time() * 1000),
-            },
-        )
+    await _require_participant(cid, me)
+    await conversations.mark_read(cid, me, body.up_to_seq)

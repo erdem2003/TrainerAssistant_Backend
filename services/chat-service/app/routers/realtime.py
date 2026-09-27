@@ -16,11 +16,15 @@ dogrulamiyor). Erisim token'i 15 dakikada bir doluyor. Token'in bitis zamani
 Istemci bu ani `HELLO` cercevesinden once biliyor ve -60sn'de yeni soketi
 ACIP sonra eskisini kapatiyor (ADR 0014) — kesinti sifir.
 
-★ FAZ S6 GÜNCELLEMESİ ★ Soket artık `app/hub.py`'ye KAYDEDİLİYOR — HTTP'den
-gelen bir mesaj (`app/routers/conversations.py`) Redis üzerinden buraya
-düşüyor. İstemciden gelen metin çerçeveleri YOK SAYILIYOR (loglanıp atılıyor):
-protokol RECEIVE-ONLY (ADR 0014) — yazma her zaman HTTP'den, S1'in echo'su
-kaldırıldı.
+★ ADR 0019 — BU UÇ ARTIK KISMEN GEREKSİZ ★
+Sohbet mesajı (MESSAGE), okundu (RECEIPT) ve sosyal bildirim (NOTIFICATION)
+çerçeveleri bu sokete artık GELMİYOR: üçü de Firestore dokümanı olarak
+yazılıyor ve mobil snapshot dinleyicisiyle okuyor. Soketten geçen tek trafik
+canlı ortak antrenman rölesi (`routers/live.py`, SESSION_*) ve HELLO. JWT/
+`X-Token-Exp` ömür mantığı nginx `auth_request` dönemine ait; tek süreçli
+dağıtımda kimlik Firebase ID token'ından geliyor (`nabiz_firebase.auth`).
+Canlı röle de dinleyiciye taşınınca bu router tamamen kaldırılabilir.
+İstemciden gelen metin çerçeveleri YOK SAYILIYOR (RECEIVE-ONLY, ADR 0014).
 """
 
 from __future__ import annotations

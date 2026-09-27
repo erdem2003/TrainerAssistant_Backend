@@ -4,14 +4,15 @@ version = "1.0.0"
 description = "AI Fitness Coach - birebir mesajlasma + gercek zamanli tasima servisi (ADR 0014)"
 requires-python = ">=3.12"
 
-# `health-service` ile AYNI temel kume, artı `redis`:
+# `health-service` ile AYNI temel kume:
 #   - bcrypt / pyjwt YOK : bu servis credential tutmuyor, token dogrulamiyor.
 #                          Kimlik gateway'de dogrulaniyor (service-contract §2),
 #                          buraya X-User-Id olarak geliyor. Soket omru icin de
 #                          JWT cozmuyor — gateway'in zaten dogruladigi bitis
 #                          zamanini X-Token-Exp basligindan okuyor (ADR 0014).
-#   - redis GEREKLI       : sosyal bildirimlerin ve coklu-ornek dagitiminin
-#                          surecler-arasi koprusu (ADR 0014, "Redis pub/sub").
+#   - redis / asyncpg YOK (ADR 0019): veri Firestore'da; mesaj/okundu/bildirim
+#                          sinyali Firestore dinleyicisinde, canli rolenin hub'i
+#                          tek surecte bellek ici.
 #   - uvicorn[standard]   : websockets kutuphanesini birlikte getiriyor,
 #                          ayri bir WS bagimliligi eklemeye gerek yok.
 #   - httpx GEREKLI (Faz S6): social-service'e senkron dahili cagri
@@ -21,10 +22,10 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "asyncpg>=0.30",
+    "google-cloud-firestore>=2.19",
+    "firebase-admin>=6.6",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
-    "redis>=5.1",
     "httpx>=0.28",
 ]
 

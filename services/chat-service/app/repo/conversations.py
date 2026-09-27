@@ -1,12 +1,18 @@
-"""conversations / conversation_participants SQL (ADR 0014, Faz S6)."""
+"""Konuşmalar — `chat_conversations/{id}` (ADR 0014 Faz S6, yerleşim `app/db.py`)."""
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
-import asyncpg
+from google.api_core.exceptions import AlreadyExists
+from google.cloud import firestore
+from google.cloud.firestore_v1.field_path import FieldPath
+
+from app.db import db
+
+_ID_NAMESPACE = uuid.UUID("5d1e7c38-2b9a-4f0e-8c61-3a7d9e2f4b10")
 
 
 def _pair(a: uuid.UUID, b: uuid.UUID) -> tuple[uuid.UUID, uuid.UUID]:
@@ -14,68 +20,18 @@ def _pair(a: uuid.UUID, b: uuid.UUID) -> tuple[uuid.UUID, uuid.UUID]:
     return (a, b) if str(a) < str(b) else (b, a)
 
 
-_FIND_BY_PAIR = "SELECT id FROM conversations WHERE user_low = $1 AND user_high = $2"
+def conversation_id_for(a: uuid.UUID, b: uuid.UUID) -> uuid.UUID:
+    low, high = _pair(a, b)
+    return uuid.uuid5(_ID_NAMESPACE, f"{low}:{high}")
 
-_INSERT_CONVERSATION = """
-INSERT INTO conversations (id, user_low, user_high) VALUES ($1, $2, $3)
-ON CONFLICT (user_low, user_high) DO NOTHING
-RETURNING id
-"""
 
-_INSERT_PARTICIPANT = """
-INSERT INTO conversation_participants (conversation_id, user_id) VALUES ($1, $2)
-ON CONFLICT (conversation_id, user_id) DO NOTHING
-"""
+def ref(conversation_id: uuid.UUID):
+    return db.collection("conversations").document(str(conversation_id))
 
-_FIND_PARTICIPANT = """
-SELECT last_read_seq, left_at FROM conversation_participants
- WHERE conversation_id = $1 AND user_id = $2
-"""
 
-_FIND_PEER = """
-SELECT user_id FROM conversation_participants
- WHERE conversation_id = $1 AND user_id != $2
-"""
-
-_MARK_READ = """
-UPDATE conversation_participants
-   SET last_read_seq = GREATEST(last_read_seq, $3), last_read_at = now()
- WHERE conversation_id = $1 AND user_id = $2
-"""
-
-# Faz S10: hesap silindiğinde satır SİLİNMEZ — `last_read_seq`/geçmiş
-# karşı tarafın konuşma listesinde kalmalı (ADR 0014 Sonuçlar, "sohbet hâlâ
-# okunabilir"). Yalnızca `left_at` damgalanır.
-_MARK_LEFT_ALL = """
-UPDATE conversation_participants SET left_at = now()
- WHERE user_id = $1 AND left_at IS NULL
-"""
-
-# ★ LİSTE SORGUSU ★ Konuşma başına: karşı taraf, son mesaj önizlemesi,
-# okunmamış sayısı — hepsi TEK sorguda, `LATERAL` ile son mesaja bakılıyor.
-_SELECT_FOR_USER = """
-SELECT c.id AS conversation_id,
-       cp_peer.user_id AS peer_id,
-       cp_me.last_read_seq AS my_last_read_seq,
-       c.next_seq - 1 AS max_seq,
-       last_msg.body AS last_body,
-       last_msg.sender_id AS last_sender_id,
-       last_msg.created_at AS last_created_at,
-       last_msg.redacted_at AS last_redacted_at
-  FROM conversation_participants cp_me
-  JOIN conversations c ON c.id = cp_me.conversation_id
-  JOIN conversation_participants cp_peer
-    ON cp_peer.conversation_id = c.id AND cp_peer.user_id != cp_me.user_id
-  LEFT JOIN LATERAL (
-      SELECT body, sender_id, created_at, redacted_at
-        FROM messages m
-       WHERE m.conversation_id = c.id
-       ORDER BY m.seq DESC
-       LIMIT 1
-  ) last_msg ON true
- WHERE cp_me.user_id = $1
- ORDER BY COALESCE(last_msg.created_at, c.created_at) DESC
-"""
+def read_field(user_id: uuid.UUID, name: str) -> str:
+    """`reads.{uuid}.{alan}` — UUID'deki tire nedeniyle alan yolu tırnaklı."""
+    return FieldPath("reads", str(user_id), name).to_api_repr()
 
 
 @dataclass(frozen=True)
@@ -86,56 +42,97 @@ class ConversationSummary:
     last_body: str | None
     last_sender_id: uuid.UUID | None
     last_created_at: datetime | None
-    last_redacted_at: datetime | None
+    last_redacted: bool
 
 
-async def get_or_create(conn: asyncpg.Connection, user_a: uuid.UUID, user_b: uuid.UUID) -> uuid.UUID:
+async def get_or_create(user_a: uuid.UUID, user_b: uuid.UUID) -> uuid.UUID:
+    """Deterministik kimlik + `create()`: eşzamanlı iki istek aynı dokümanı
+    oluşturmaya çalışır, biri AlreadyExists alır — kayıp yok, çift kayıt yok
+    (Postgres'teki `ON CONFLICT DO NOTHING RETURNING` yarış dalının karşılığı)."""
     low, high = _pair(user_a, user_b)
-
-    existing = await conn.fetchrow(_FIND_BY_PAIR, low, high)
-    if existing is not None:
-        return existing["id"]
-
-    new_id = uuid.uuid4()
-    row = await conn.fetchrow(_INSERT_CONVERSATION, new_id, low, high)
-    # ON CONFLICT DO NOTHING + RETURNING: eşzamanlı iki istek aynı anda ilk
-    # kayıt için yarışırsa biri RETURNING alır, diğeri None görür — o zaman
-    # zaten oluşmuş satırı tekrar okur (kayıp yok, çift satır da yok).
-    conversation_id = row["id"] if row is not None else (await conn.fetchrow(_FIND_BY_PAIR, low, high))["id"]
-
-    await conn.execute(_INSERT_PARTICIPANT, conversation_id, user_a)
-    await conn.execute(_INSERT_PARTICIPANT, conversation_id, user_b)
+    conversation_id = conversation_id_for(user_a, user_b)
+    try:
+        await ref(conversation_id).create({
+            "user_low": str(low),
+            "user_high": str(high),
+            "participants": [str(low), str(high)],
+            "next_seq": 1,
+            "created_at": datetime.now(timezone.utc),
+            "last_message": None,
+            "last_message_at": None,
+            "reads": {
+                str(low): {"last_read_seq": 0, "last_read_at": None, "left_at": None},
+                str(high): {"last_read_seq": 0, "last_read_at": None, "left_at": None},
+            },
+        })
+    except AlreadyExists:
+        pass
     return conversation_id
 
 
-async def find_participant(conn: asyncpg.Connection, conversation_id: uuid.UUID, user_id: uuid.UUID):
-    return await conn.fetchrow(_FIND_PARTICIPANT, conversation_id, user_id)
+async def find(conversation_id: uuid.UUID) -> dict | None:
+    snap = await ref(conversation_id).get()
+    return snap.to_dict() if snap.exists else None
 
 
-async def find_peer(conn: asyncpg.Connection, conversation_id: uuid.UUID, user_id: uuid.UUID) -> uuid.UUID | None:
-    row = await conn.fetchrow(_FIND_PEER, conversation_id, user_id)
-    return row["user_id"] if row else None
+def peer_of(conversation: dict, user_id: uuid.UUID) -> uuid.UUID | None:
+    others = [p for p in conversation.get("participants", []) if p != str(user_id)]
+    return uuid.UUID(others[0]) if others else None
 
 
-async def mark_read(conn: asyncpg.Connection, conversation_id: uuid.UUID, user_id: uuid.UUID, up_to_seq: int) -> None:
-    await conn.execute(_MARK_READ, conversation_id, user_id, up_to_seq)
+def is_participant(conversation: dict | None, user_id: uuid.UUID) -> bool:
+    return conversation is not None and str(user_id) in conversation.get("participants", [])
 
 
-async def mark_left_all(conn: asyncpg.Connection, user_id: uuid.UUID) -> None:
-    await conn.execute(_MARK_LEFT_ALL, user_id)
+async def mark_read(conversation_id: uuid.UUID, user_id: uuid.UUID, up_to_seq: int) -> None:
+    """★ MAKSİMUM SEMANTİĞİ ★ Postgres'teki `GREATEST(last_read_seq, $3)`:
+    Firestore'un sunucu tarafı `Maximum` dönüşümü — geç gelen eski bir okundu
+    bildirimi ilerlemeyi GERİ ALAMAZ, transaction gerekmez."""
+    await ref(conversation_id).update({
+        read_field(user_id, "last_read_seq"): firestore.Maximum(up_to_seq),
+        read_field(user_id, "last_read_at"): firestore.SERVER_TIMESTAMP,
+    })
 
 
-async def list_for_user(conn: asyncpg.Connection, user_id: uuid.UUID) -> list[ConversationSummary]:
-    rows = await conn.fetch(_SELECT_FOR_USER, user_id)
-    return [
-        ConversationSummary(
-            conversation_id=r["conversation_id"],
-            peer_id=r["peer_id"],
-            unread_count=max(0, r["max_seq"] - r["my_last_read_seq"]),
-            last_body=r["last_body"],
-            last_sender_id=r["last_sender_id"],
-            last_created_at=r["last_created_at"],
-            last_redacted_at=r["last_redacted_at"],
-        )
-        for r in rows
-    ]
+async def list_for_user(user_id: uuid.UUID) -> list[ConversationSummary]:
+    """Konuşma başına tek doküman; son mesaj ve okunmamış sayısı dokümanın
+    üzerinde. Sıralama: son mesaj (yoksa oluşturulma) yeniden eskiye."""
+    query = db.collection("conversations").where(
+        filter=firestore.FieldFilter("participants", "array_contains", str(user_id))
+    )
+    rows = []
+    async for snap in query.stream():
+        d = snap.to_dict()
+        peer = peer_of(d, user_id)
+        if peer is None:
+            continue
+        last = d.get("last_message") or {}
+        my_read = int(((d.get("reads") or {}).get(str(user_id)) or {}).get("last_read_seq", 0))
+        rows.append((
+            d.get("last_message_at") or d["created_at"],
+            ConversationSummary(
+                conversation_id=uuid.UUID(snap.id),
+                peer_id=peer,
+                unread_count=max(0, int(d.get("next_seq", 1)) - 1 - my_read),
+                last_body=last.get("body"),
+                last_sender_id=uuid.UUID(last["sender_id"]) if last.get("sender_id") else None,
+                last_created_at=last.get("created_at"),
+                last_redacted=bool(last.get("redacted")),
+            ),
+        ))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return [summary for _, summary in rows]
+
+
+async def for_user(user_id: uuid.UUID) -> list:
+    """Kullanıcının tüm konuşma snapshot'ları (hesap silme)."""
+    query = db.collection("conversations").where(
+        filter=firestore.FieldFilter("participants", "array_contains", str(user_id))
+    )
+    return [snap async for snap in query.stream()]
+
+
+async def mark_left(conversation_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    """Faz S10: hesap silindiğinde konuşma SİLİNMEZ — geçmiş karşı tarafın
+    listesinde kalır (ADR 0014 Sonuçlar). Yalnızca `left_at` damgalanır."""
+    await ref(conversation_id).update({read_field(user_id, "left_at"): firestore.SERVER_TIMESTAMP})
