@@ -1,0 +1,14 @@
+# Cloud Build'e yüklenmeyecekler: sanal ortam, önbellekler, testler, yerel sırlar.
+.gcloudignore
+.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/tests/
+**/migrations/
+**/.env
+infra/
+api-gateway/
+gateway/
+conftest.py
+pytest.ini
+docker-compose.yml

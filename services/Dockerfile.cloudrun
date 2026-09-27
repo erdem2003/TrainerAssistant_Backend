@@ -1,0 +1,30 @@
+# Cloud Run imajı — yedi servis için TEK tanım (ADR 0020).
+#
+# Derleme bağlamı `services/`: ortak `nabiz_firebase` paketi (shared/) her
+# servisin imajına kopyalanıyor. Hangi servisin paketleneceğini SERVICE seçer:
+#   docker build -f Dockerfile.cloudrun --build-arg SERVICE=workout .
+#
+# Servis klasörlerindeki eski Dockerfile'lar Postgres dağıtımına ait
+# (migrations kopyalıyor); o düzen `postgres` dalında yaşıyor.
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+ARG SERVICE
+WORKDIR /srv
+
+# Önce yalnız bağımlılık tanımı: kod değiştiğinde bu katman önbellekten gelir.
+COPY ${SERVICE}-service/pyproject.toml ./
+RUN uv pip install --system --no-cache -r pyproject.toml
+
+COPY shared ./shared
+COPY ${SERVICE}-service/app ./app
+
+# NABIZ_STANDALONE=1: token'ı servis kendisi doğrular, olaylar HTTP ile gider
+# (nabiz_firebase.deploy). Cloud Run PORT'u kendisi verir.
+ENV PYTHONPATH=/srv/shared \
+    PYTHONUNBUFFERED=1 \
+    NABIZ_STANDALONE=1
+
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /srv
+USER appuser
+
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]

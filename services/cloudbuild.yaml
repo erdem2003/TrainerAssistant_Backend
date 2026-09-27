@@ -1,0 +1,49 @@
+# Yedi servisin imajını paralel derleyip Artifact Registry'ye iter (ADR 0020).
+#   gcloud builds submit services --config services/cloudbuild.yaml --substitutions=_TAG=$(git rev-parse --short HEAD)
+# Dağıtım (gcloud run deploy) ayrı adım: scripts/deploy-cloudrun.sh.
+substitutions:
+  _REGION: europe-west1
+  _REPO: nabiz
+  _TAG: latest
+
+steps:
+  - id: user
+    name: gcr.io/cloud-builders/docker
+    args: [build, -f, Dockerfile.cloudrun, --build-arg, SERVICE=user, -t, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/user:${_TAG}", .]
+    waitFor: ["-"]
+  - id: health
+    name: gcr.io/cloud-builders/docker
+    args: [build, -f, Dockerfile.cloudrun, --build-arg, SERVICE=health, -t, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/health:${_TAG}", .]
+    waitFor: ["-"]
+  - id: workout
+    name: gcr.io/cloud-builders/docker
+    args: [build, -f, Dockerfile.cloudrun, --build-arg, SERVICE=workout, -t, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/workout:${_TAG}", .]
+    waitFor: ["-"]
+  - id: analytics
+    name: gcr.io/cloud-builders/docker
+    args: [build, -f, Dockerfile.cloudrun, --build-arg, SERVICE=analytics, -t, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/analytics:${_TAG}", .]
+    waitFor: ["-"]
+  - id: social
+    name: gcr.io/cloud-builders/docker
+    args: [build, -f, Dockerfile.cloudrun, --build-arg, SERVICE=social, -t, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/social:${_TAG}", .]
+    waitFor: ["-"]
+  - id: chat
+    name: gcr.io/cloud-builders/docker
+    args: [build, -f, Dockerfile.cloudrun, --build-arg, SERVICE=chat, -t, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/chat:${_TAG}", .]
+    waitFor: ["-"]
+  - id: auth
+    name: gcr.io/cloud-builders/docker
+    args: [build, -f, Dockerfile.cloudrun, --build-arg, SERVICE=auth, -t, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/auth:${_TAG}", .]
+    waitFor: ["-"]
+
+images:
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/user:${_TAG}"
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/health:${_TAG}"
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/workout:${_TAG}"
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/analytics:${_TAG}"
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/social:${_TAG}"
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/chat:${_TAG}"
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/auth:${_TAG}"
+
+# Makine tipi BİLEREK verilmiyor: ücretsiz derleme dakikaları (ayda 2.500)
+# yalnızca varsayılan makinede geçerli.
