@@ -9,9 +9,8 @@ import uuid
 from fastapi import APIRouter, Header, Response, status
 
 from app.config import settings
-from app.db import db
 from app.errors import ApiError, forbidden
-from app.repo import processed_events, sleep, water
+from app.repo import processed_events, users
 
 logger = logging.getLogger(__name__)
 
@@ -56,23 +55,19 @@ async def delete_user_data(
             "X-Event-Id geçerli bir UUID olmalı",
         ) from None
 
-    async with db.pool.acquire() as conn:
-        # Idempotency kaydı ve silme AYNI TRANSACTION'da. Ayrı olsalardı, kayıt
-        # yazılıp silme başarısız olduğunda event "işlendi" sayılır ve veri
-        # sonsuza kadar kalırdı.
-        async with conn.transaction():
-            first_time = await processed_events.claim(
-                conn, event_id, EVENT_ACCOUNT_DELETED
-            )
-            if not first_time:
-                logger.info("event zaten işlenmiş, atlanıyor event_id=%s", event_id)
-                return Response(status_code=status.HTTP_204_NO_CONTENT)
+    # ★ SIRA: ÖNCE SİL, SONRA İŞARETLE ★ Firestore'da özyinelemeli silme bir
+    # transaction'a girmiyor. Silme kendi başına idempotent (olmayanı silmek
+    # zararsız), bu yüzden önce silinip sonra event işlendi sayılıyor: arada
+    # çökülürse yeniden teslimde tekrar silinir, veri kalmaz. Ters sıra (önce
+    # işaretle) çökmede veriyi SONSUZA kadar bırakırdı.
+    if await processed_events.exists(event_id):
+        logger.info("event zaten işlenmiş, atlanıyor event_id=%s", event_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-            deleted_water = await water.delete_by_user(conn, user_id)
-            deleted_sleep = await sleep.delete_by_user(conn, user_id)
+    deleted = await users.delete_all(user_id)
+    await processed_events.claim(event_id, EVENT_ACCOUNT_DELETED)
 
     logger.info(
-        "hesap silme işlendi user_id=%s silinen_su=%s silinen_uyku=%s",
-        user_id, deleted_water, deleted_sleep,
+        "hesap silme işlendi user_id=%s silinen_doküman=%s", user_id, deleted,
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

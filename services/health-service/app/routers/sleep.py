@@ -7,7 +7,6 @@ from datetime import date
 
 from fastapi import APIRouter, Header, Query, Response, status
 
-from app.db import db
 from app.errors import unprocessable
 from app.identity import require_user_id
 from app.repo import sleep
@@ -43,8 +42,7 @@ async def get_sleep(
     user_id = require_user_id(x_user_id)
     target = _parse_date(day, "date")
 
-    async with db.pool.acquire() as conn:
-        row = await sleep.fetch_day(conn, user_id, target)
+    row = await sleep.fetch_day(user_id, target)
 
     return SleepDayOut(
         date=target.isoformat(),
@@ -62,8 +60,7 @@ async def set_sleep(
     user_id = require_user_id(x_user_id)
     target = _parse_date(day, "date")
 
-    async with db.pool.acquire() as conn:
-        row = await sleep.set_minutes(conn, user_id, target, payload.minutes)
+    row = await sleep.set_minutes(user_id, target, payload.minutes)
 
     logger.info("uyku kaydedildi user_id=%s gün=%s dakika=%d",
                 user_id, target, row.minutes)
@@ -83,8 +80,7 @@ async def delete_sleep(
     user_id = require_user_id(x_user_id)
     target = _parse_date(day, "date")
 
-    async with db.pool.acquire() as conn:
-        await sleep.delete_day(conn, user_id, target)
+    await sleep.delete_day(user_id, target)
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -105,8 +101,7 @@ async def get_sleep_range(
     if (last - first).days + 1 > _MAX_RANGE_DAYS:
         raise unprocessable("Aralık çok geniş", {"max_days": _MAX_RANGE_DAYS})
 
-    async with db.pool.acquire() as conn:
-        rows = await sleep.fetch_range(conn, user_id, first, last)
+    rows = await sleep.fetch_range(user_id, first, last)
 
     return SleepRangeOut(
         days=[

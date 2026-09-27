@@ -7,7 +7,6 @@ from datetime import date
 
 from fastapi import APIRouter, Header, Query
 
-from app.db import db
 from app.errors import unprocessable
 from app.identity import require_user_id
 from app.repo import water
@@ -44,8 +43,7 @@ async def get_water(
     user_id = require_user_id(x_user_id)
     target = _parse_date(day, "date")
 
-    async with db.pool.acquire() as conn:
-        row = await water.fetch_day(conn, user_id, target)
+    row = await water.fetch_day(user_id, target)
 
     return WaterDayOut(
         date=target.isoformat(),
@@ -75,8 +73,7 @@ async def add_water(
     user_id = require_user_id(x_user_id)
     target = _parse_date(day, "date")
 
-    async with db.pool.acquire() as conn:
-        row = await water.add(conn, user_id, target, payload.amount_ml)
+    row = await water.add(user_id, target, payload.amount_ml)
 
     logger.info(
         "su eklendi user_id=%s gün=%s eklenen=%d toplam=%d",
@@ -95,8 +92,7 @@ async def set_water(
     user_id = require_user_id(x_user_id)
     target = _parse_date(day, "date")
 
-    async with db.pool.acquire() as conn:
-        row = await water.set_amount(conn, user_id, target, payload.amount_ml)
+    row = await water.set_amount(user_id, target, payload.amount_ml)
 
     return WaterDayOut(date=row.log_date.isoformat(), amount_ml=row.amount_ml)
 
@@ -117,8 +113,7 @@ async def get_water_range(
     if (last - first).days + 1 > _MAX_RANGE_DAYS:
         raise unprocessable("Aralık çok geniş", {"max_days": _MAX_RANGE_DAYS})
 
-    async with db.pool.acquire() as conn:
-        rows = await water.fetch_range(conn, user_id, first, last)
+    rows = await water.fetch_range(user_id, first, last)
 
     return WaterRangeOut(
         days=[
