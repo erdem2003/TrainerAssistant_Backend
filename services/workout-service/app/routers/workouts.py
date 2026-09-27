@@ -8,8 +8,9 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Header, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Header, Query, Response, status
 from google.cloud import firestore
+from nabiz_firebase.deploy import standalone
 
 from app import events
 from app.config import settings
@@ -64,6 +65,7 @@ def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
 async def create_workout(
     payload: WorkoutIn,
     response: Response,
+    background_tasks: BackgroundTasks,
     x_user_id: str | None = Header(default=None),
 ) -> WorkoutOut:
     """Antrenmanı kaydeder. AYNI ID İKİNCİ KEZ GELİRSE YENİ KAYIT AÇILMAZ.
@@ -146,8 +148,14 @@ async def create_workout(
         response.status_code = status.HTTP_200_OK
         return await _load_detail(payload.id, user_id)
 
-    # Commit oldu — dağıtıcıyı yoklama beklemeden uyandır (tek süreç).
-    outbox.dispatcher().notify()
+    # Commit oldu — olayı yoklama beklemeden dağıt. Tek süreçte döngüyü
+    # uyandırmak yeter; Cloud Run'da (ADR 0020) istek bitince CPU kesildiği
+    # için dağıtım bu isteğin arka plan görevinde yapılır. Başarısız olursa
+    # olay kuyrukta kalır, zamanlayıcı `/internal/outbox/dispatch` ile toplar.
+    if standalone():
+        background_tasks.add_task(outbox.dispatcher().dispatch_pending)
+    else:
+        outbox.dispatcher().notify()
 
     logger.info(
         "antrenman kaydedildi workout_id=%s set=%d tekrar=%d",

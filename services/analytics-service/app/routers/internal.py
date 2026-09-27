@@ -11,6 +11,7 @@ from fastapi import APIRouter, Header, Response, status
 from app.config import settings
 from app.errors import ApiError, forbidden
 from app.repo import facts, processed_events
+from app.worker import consumer
 
 logger = logging.getLogger(__name__)
 
@@ -70,4 +71,19 @@ async def delete_user_data(
     logger.info(
         "hesap silme işlendi user_id=%s silinen_doküman=%s", user_id, deleted,
     )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/events", status_code=status.HTTP_204_NO_CONTENT)
+async def receive_event(
+    envelope: dict,
+    x_internal_key: str | None = Header(default=None),
+) -> Response:
+    """Outbox olayının HTTP ile teslimi (ADR 0020 — ayrı dağıtım).
+
+    Süreç içi abonelikle AYNI işleyici; idempotency `processed_events`'te.
+    İşleyici patlarsa 5xx döner ve üretici olayı kuyrukta tutup yeniden dener.
+    """
+    _require_internal_key(x_internal_key)
+    await consumer.handle(envelope)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

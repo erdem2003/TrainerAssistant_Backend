@@ -10,7 +10,7 @@ from fastapi import APIRouter, Header, Response, status
 
 from app.config import settings
 from app.errors import ApiError, forbidden
-from app.repo import processed_events, users
+from app.repo import outbox, processed_events, users
 
 logger = logging.getLogger(__name__)
 
@@ -71,3 +71,12 @@ async def delete_user_data(
         "hesap silme işlendi user_id=%s silinen_doküman=%s", user_id, deleted,
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/outbox/dispatch")
+async def dispatch_outbox(x_internal_key: str | None = Header(default=None)) -> dict:
+    """Bekleyen olayları teslim eder — Cloud Scheduler'ın yeniden deneme yolu
+    (ADR 0020). Tek süreçte dağıtıcı döngüsü aynı işi kendisi yapıyor."""
+    _require_internal_key(x_internal_key)
+    sent = await outbox.dispatcher().dispatch_pending()
+    return {"dispatched": sent}

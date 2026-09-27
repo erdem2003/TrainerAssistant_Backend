@@ -30,6 +30,7 @@ from app.repo import (
     snapshots,
     tombstones,
 )
+from app.worker import workout_consumer
 
 logger = logging.getLogger(__name__)
 
@@ -151,3 +152,29 @@ async def batch_profiles(
             for p in results
         ]
     }
+
+
+@router.post("/events", status_code=status.HTTP_204_NO_CONTENT)
+async def receive_event(
+    envelope: dict,
+    x_internal_key: str | None = Header(default=None),
+) -> Response:
+    """Outbox olayının HTTP ile teslimi (ADR 0020 — ayrı dağıtım).
+
+    Süreç içi abonelikle AYNI işleyici; idempotency `processed_events`'te.
+    İşleyici patlarsa 5xx döner ve üretici olayı kuyrukta tutup yeniden dener.
+    """
+    _require_internal_key(x_internal_key)
+    await workout_consumer.handle(envelope)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/sweep", status_code=status.HTTP_204_NO_CONTENT)
+async def sweep_stale_posts(x_internal_key: str | None = Header(default=None)) -> Response:
+    """Bayat PENDING_SNAPSHOT gönderilerini siler — Cloud Scheduler çağırır
+    (ADR 0020; tek süreçte aynı işi `sweep_stale_posts_loop` yapıyor)."""
+    _require_internal_key(x_internal_key)
+    deleted = await posts.sweep_stale_pending()
+    if deleted:
+        logger.info("bayat PENDING_SNAPSHOT gönderi silindi adet=%d", deleted)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
