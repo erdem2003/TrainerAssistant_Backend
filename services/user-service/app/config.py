@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     service_name: str = "user-service"
     log_level: str = "INFO"
 
-    database_url: str = "postgresql://trainer:trainer@localhost:5433/user_db"
+    database_url: str = "postgresql://trainer:trainer@localhost:15433/user_db"
     db_pool_min: int = 2
     db_pool_max: int = 10
 

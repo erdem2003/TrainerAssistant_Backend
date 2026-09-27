@@ -58,6 +58,9 @@ def dispatch(event_id: str, event_type: str, payload: dict) -> None:
         ("user-service", settings.user_service_url),
         ("workout-service", settings.workout_service_url),
         ("health-service", settings.health_service_url),
+        ("analytics-service", settings.analytics_service_url),
+        ("social-service", settings.social_service_url),
+        ("chat-service", settings.chat_service_url),
     ]
 
     for service, base_url in targets:

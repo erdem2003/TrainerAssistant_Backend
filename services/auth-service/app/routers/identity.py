@@ -20,6 +20,7 @@ router = APIRouter(prefix="/v1/auth", tags=["identity"])
 
 HEADER_USER_ID = "X-User-Id"
 HEADER_EMAIL_VERIFIED = "X-Email-Verified"
+HEADER_TOKEN_EXP = "X-Token-Exp"
 
 
 def _unauthorized() -> ApiError:
@@ -68,6 +69,13 @@ async def introspect(
         headers={
             HEADER_USER_ID: claims["sub"],
             HEADER_EMAIL_VERIFIED: str(claims.get("email_verified", False)).lower(),
+            # `exp` JWT standardında epoch SANIYE; sözleşme (§6) epoch
+            # MILISANIYE istiyor — chat-service'in `/ws` el sıkışmasında
+            # soket ömrünü sınırlaması için (ADR 0014, "Soket ömrü ve token
+            # süresi"). chat-service bu sayıyı hiç yorumlamıyor, yalnızca
+            # o ana geldiğinde bağlantıyı kapatıyor — JWT çözümü burada,
+            # tek yerde kalıyor (service-contract §2).
+            HEADER_TOKEN_EXP: str(claims["exp"] * 1000),
         },
     )
 

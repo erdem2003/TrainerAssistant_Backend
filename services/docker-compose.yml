@@ -19,9 +19,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trainer}
       POSTGRES_DB: postgres
     ports:
-      # 5433 bilinçli: geliştiricinin makinesinde zaten bir Postgres olabilir ve
+      # 15433 bilinçli: geliştiricinin makinesinde zaten bir Postgres (5432/5433) olabilir ve
       # 5432 çakışması ilk denemede anlaşılması zor bir hata üretir.
-      - "5433:5432"
+      - "15433:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/init-databases.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
@@ -63,7 +63,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "${REDIS_HOST_PORT:-6380}:6379"
+      - "${REDIS_HOST_PORT:-16380}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
@@ -102,7 +102,7 @@ services:
       RESEND_COOLDOWN_SECONDS: ${RESEND_COOLDOWN_SECONDS:-10}
       RESEND_PER_EMAIL_PER_HOUR: ${RESEND_PER_EMAIL_PER_HOUR:-50}
     ports:
-      - "8001:8000"
+      - "18001:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -135,7 +135,7 @@ services:
     ports:
       # Gelistirmede gateway'i atlayarak dogrudan test edebilmek icin.
       # Uretimde bu yayin KALDIRILIR — tek dis kapi gateway olmali.
-      - "8002:8000"
+      - "18002:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -158,7 +158,7 @@ services:
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
     ports:
       # Gelistirmede gateway'i atlayarak test etmek icin. Uretimde KALDIRILIR.
-      - "8003:8000"
+      - "18003:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -211,8 +211,9 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SERVICE_NAME: analytics-service
       KAFKA_BOOTSTRAP: redpanda:9092
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
     ports:
-      - "8005:8000"
+      - "18005:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -261,13 +262,131 @@ services:
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
     ports:
       # Gelistirmede gateway'i atlayarak test etmek icin. Uretimde KALDIRILIR.
-      - "8004:8000"
+      - "18004:8000"
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - ./health-service/app:/srv/app:ro
       - ./health-service/migrations:/srv/migrations:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # MinIO — motivasyon gonderisi fotograflari icin nesne deposu (ADR 0016).
+  #
+  # ★ AGA ACILMIYOR ★ Yalnizca social-service ic agdan (compose network)
+  # konusuyor. Mobil istemci hicbir zaman MinIO'ya dogrudan gitmiyor — foto
+  # `GET /v1/social/posts/{id}/photo` uzerinden, arkadaslik kontrolunden
+  # gectikten sonra social-service tarafindan akitiliyor (docs/architecture/
+  # overview.md'nin "tek public giris: api-gateway" kuralinin sonucu).
+  #
+  # Imaj: `minio/minio` Docker Hub'dan kaldirildi (2026-09, pull access denied);
+  # ayni MinIO surumunun (2024.10.13) Bitnami arsiv imaji kullaniliyor. Bitnami
+  # entrypoint'i sunucuyu kendisi baslatiyor (command yok), veri yolu
+  # /bitnami/minio/data, surec uid 1001 ile calisiyor.
+  minio:
+    image: bitnamilegacy/minio:2024.10.13
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-trainer}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-trainer123}
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # social-service — sosyal graf ve paylasim (ADR 0014).
+  #
+  # Kendi veritabani `social_db`. Kullanici adi/gorunen ad/avatar BURADA
+  # yasiyor, `user_db`'de degil (ADR 0014, "Kullanici adi neden social_db'de").
+  # `workout.session` topic'ini KENDI tuketici grubuyla (`social-workout-v1`)
+  # dinliyor (Faz S3, `social-consumer` sureci) — workout-service bunun
+  # varligini hic bilmiyor.
+  social-service:
+    build:
+      context: ./social-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/social_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: social-service
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP: redpanda:9092
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-trainer}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-trainer123}
+      MINIO_BUCKET: social-photos
+      MINIO_SECURE: "false"
+    ports:
+      # Gelistirmede gateway'i atlayarak test etmek icin. Uretimde KALDIRILIR.
+      - "18006:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./social-service/app:/srv/app:ro
+      - ./social-service/migrations:/srv/migrations:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # social-consumer — social-service'in IKINCI SURECI (Faz S3, aktif).
+  #
+  # `analytics-consumer` ile AYNI DESEN: `workout.session`'i kendi grubuyla
+  # dinler, `workout_snapshots` projeksiyonunu besler. Ayrica silinen
+  # kullanicilar icin `deleted_users` tombstone kontrolu yapar ve hata
+  # dongusunde `consumer.seek()` ile offset'e geri sarar (bkz.
+  # `app/worker/workout_consumer.py` basindaki not).
+  social-consumer:
+    build:
+      context: ./social-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/social_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: social-consumer
+      KAFKA_BOOTSTRAP: redpanda:9092
+      REPLAY_MODE: ${REPLAY_MODE:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    volumes:
+      - ./social-service/app:/srv/app:ro
+      - ./social-service/migrations:/srv/migrations:ro
+    command: python -m app.worker.workout_consumer
+
+  # chat-service — birebir mesajlasma + tek gercek zamanli tasima (ADR 0014).
+  #
+  # Kendi veritabani `chat_db`. WebSocket `/ws` ucu burada; sosyal
+  # bildirimler de (Faz S6'dan itibaren) ayni soketten bu servis uzerinden
+  # akiyor — social-service Redis'e yazar, chat-service iletir.
+  chat-service:
+    build:
+      context: ./chat-service
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trainer}:${POSTGRES_PASSWORD:-trainer}@postgres:5432/chat_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: chat-service
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+      REDIS_URL: redis://redis:6379/0
+      SOCIAL_SERVICE_URL: http://social-service:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      social-service:
+        condition: service_started
+    ports:
+      # Gelistirmede gateway'i atlayarak test etmek icin. Uretimde KALDIRILIR.
+      - "18007:8000"
+    volumes:
+      - ./chat-service/app:/srv/app:ro
+      - ./chat-service/migrations:/srv/migrations:ro
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   # E-posta worker'ı — auth-service'in İKİNCİ SÜRECİ, ayrı servis değil.
@@ -288,10 +407,13 @@ services:
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       MAIL_FROM: ${MAIL_FROM:-AI Fitness Coach <no-reply@trainerasistant.local>}
-      # Hesap silindiğinde user-service'e haber vermek için (bkz. worker/fanout.py).
+      # Hesap silindiğinde diğer servislere haber vermek için (bkz. worker/fanout.py).
       USER_SERVICE_URL: http://user-service:8000
       WORKOUT_SERVICE_URL: http://workout-service:8000
       HEALTH_SERVICE_URL: http://health-service:8000
+      ANALYTICS_SERVICE_URL: http://analytics-service:8000
+      SOCIAL_SERVICE_URL: http://social-service:8000
+      CHAT_SERVICE_URL: http://chat-service:8000
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
     depends_on:
       postgres:
@@ -304,6 +426,12 @@ services:
         # outbox satırı yeniden denenir — ama gereksiz hata log'u üretmesin.
         condition: service_started
       workout-service:
+        condition: service_started
+      analytics-service:
+        condition: service_started
+      social-service:
+        condition: service_started
+      chat-service:
         condition: service_started
     volumes:
       - ./auth-service/app:/srv/app:ro
@@ -321,7 +449,7 @@ services:
     build:
       context: ./api-gateway
     ports:
-      - "8080:80"
+      - "18080:80"
     depends_on:
       auth-service:
         condition: service_started
@@ -331,6 +459,10 @@ services:
         condition: service_started
       health-service:
         condition: service_started
+      social-service:
+        condition: service_started
+      chat-service:
+        condition: service_started
     volumes:
       # Gelistirmede yapilandirma degisikligi icin imaji yeniden derlemeye gerek yok:
       #   docker compose exec api-gateway nginx -s reload
@@ -338,3 +470,4 @@ services:
 
 volumes:
   postgres-data:
+  minio-data:

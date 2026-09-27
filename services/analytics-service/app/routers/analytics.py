@@ -121,6 +121,9 @@ class ErrorCountOut(BaseModel):
 
 class ErrorDistributionOut(BaseModel):
     total_reps: int
+    # Eklendi (geriye uyumlu): en az bir hatası olan tekrar sayısı. Bir tekrar
+    # birden çok hata taşıyabildiği için `errors` toplamından türetilemez.
+    reps_with_errors: int = 0
     errors: list[ErrorCountOut]
 
 
@@ -130,6 +133,7 @@ async def get_error_distribution(
     start_day: str = Query(alias="from"),
     end_day: str = Query(alias="to"),
     tz_offset: int = Query(default=0),
+    exercise: str | None = Query(default=None, max_length=32),
 ) -> ErrorDistributionOut:
     """Aralıktaki form hatalarının dağılımı. `form_errors` JSONB'nin toplamı.
 
@@ -149,10 +153,13 @@ async def get_error_distribution(
     start, end = range_bounds(first, last, offset)
 
     async with db.pool.acquire() as conn:
-        rows, total_reps = await facts.fetch_error_counts(conn, user_id, start, end)
+        rows, total_reps, reps_with_errors = await facts.fetch_error_counts(
+            conn, user_id, start, end, exercise
+        )
 
     return ErrorDistributionOut(
         total_reps=total_reps,
+        reps_with_errors=reps_with_errors,
         errors=[
             ErrorCountOut(error_name=r.error_name, occurrences=r.occurrences)
             for r in rows

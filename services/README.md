@@ -5,12 +5,12 @@ dokunmaz. ADR 0006 uyarınca servisler arası asenkron akış **Kafka + outbox**
 
 | Servis | Port | Veritabanı | Ne yapıyor |
 |---|---|---|---|
-| `api-gateway` (nginx) | **8080** | — | Tek dış kapı; kimlik doğrular, `X-User-Id` yazar |
-| `auth-service` | 8001 | `auth_db` | Kayıt, doğrulama kodu, token rotasyonu, hesap silme |
-| `user-service` | 8002 | `user_db` | Profil (kilo, boy, yaş, günlük hedef) |
-| `workout-service` | 8003 | `workout_db` | Antrenman kaydı, günlük program, istatistik, egzersiz kataloğu |
-| `health-service` | 8004 | `health_db` | Su ve uyku takibi (ADR 0010) |
-| `analytics-service` | 8005 | `analytics_db` | Kafka'dan beslenen antrenman projeksiyonu |
+| `api-gateway` (nginx) | **18080** | — | Tek dış kapı; kimlik doğrular, `X-User-Id` yazar |
+| `auth-service` | 18001 | `auth_db` | Kayıt, doğrulama kodu, token rotasyonu, hesap silme |
+| `user-service` | 18002 | `user_db` | Profil (kilo, boy, yaş, günlük hedef) |
+| `workout-service` | 18003 | `workout_db` | Antrenman kaydı, günlük program, istatistik, egzersiz kataloğu |
+| `health-service` | 18004 | `health_db` | Su ve uyku takibi (ADR 0010) |
+| `analytics-service` | 18005 | `analytics_db` | Kafka'dan beslenen antrenman projeksiyonu |
 
 Ayrıca üç arka plan işçisi (ayrı konteyner, aynı imaj):
 
@@ -37,11 +37,11 @@ docker compose up --build
 
 | Ne | Nerede |
 |---|---|
-| **api-gateway (tek dış kapı)** | http://localhost:8080 |
-| Servisler (doğrudan, geliştirme) | 8001–8005 |
+| **api-gateway (tek dış kapı)** | http://localhost:18080 |
+| Servisler (doğrudan, geliştirme) | 18001–18007 |
 | API dokümanı | `http://localhost:<port>/docs` |
-| Postgres | `localhost:5433` |
-| Redis | `localhost:6380` |
+| Postgres | `localhost:15433` |
+| Redis | `localhost:16380` |
 | Redpanda (Kafka API) | `localhost:19092` |
 
 **Portlar yalnızca geliştirme için dışarı açık.** Üretimde tek giriş gateway olur;
@@ -54,8 +54,8 @@ bağlanıyor; `SMTP_PASSWORD` bir uygulama şifresi ve **depoya girmez**.
 ### Sağlık kontrolü
 
 ```bash
-curl localhost:8080/health/live                  # gateway ayakta mı
-for p in 8001 8002 8003 8004 8005; do
+curl localhost:18080/health/live                  # gateway ayakta mı
+for p in 18001 18002 18003 18004 18005 18006 18007; do
   curl -s -o /dev/null -w "$p -> %{http_code}\n" localhost:$p/health/ready
 done
 ```

@@ -58,18 +58,23 @@ COUNT_ALL = "SELECT COUNT(*) FROM workout_facts"
 # B1 — hata dagilimi. `form_errors` `{"HIP_SAG": 3, ...}` seklinde JSONB;
 # jsonb_each_text ile satir satir acilip aralik icinde toplaniyor. Ayni
 # sorguda araliktaki TOPLAM tekrar da doner — yuzdeyi cikaran istemci tarafi.
+# `$4` NULL ise tüm egzersizler; değilse yalnız o egzersiz (İlerleme / Hata
+# dağılımı ekranının egzersiz çipleri).
 SELECT_ERROR_COUNTS = """
 SELECT key AS error_name, SUM(value::int) AS occurrences
   FROM workout_facts, jsonb_each_text(form_errors)
  WHERE user_id = $1 AND started_at >= $2 AND started_at < $3
+   AND ($4::text IS NULL OR exercise_id = $4)
  GROUP BY key
  ORDER BY occurrences DESC
 """
 
 SELECT_TOTAL_REPS_IN_RANGE = """
-SELECT COALESCE(SUM(total_reps), 0) AS total_reps
+SELECT COALESCE(SUM(total_reps), 0) AS total_reps,
+       COALESCE(SUM(reps_with_errors), 0) AS reps_with_errors
   FROM workout_facts
  WHERE user_id = $1 AND started_at >= $2 AND started_at < $3
+   AND ($4::text IS NULL OR exercise_id = $4)
 """
 
 # A2 — rozetler icin tek sorguda toplanan istatistikler.
@@ -196,15 +201,21 @@ async def count_all(conn: asyncpg.Connection) -> int:
 
 
 async def fetch_error_counts(
-    conn: asyncpg.Connection, user_id: uuid.UUID, start_utc: datetime, end_utc: datetime
-) -> tuple[list[ErrorCountRow], int]:
-    rows = await conn.fetch(SELECT_ERROR_COUNTS, user_id, start_utc, end_utc)
-    total = await conn.fetchval(
-        SELECT_TOTAL_REPS_IN_RANGE, user_id, start_utc, end_utc
+    conn: asyncpg.Connection,
+    user_id: uuid.UUID,
+    start_utc: datetime,
+    end_utc: datetime,
+    exercise_id: str | None = None,
+) -> tuple[list[ErrorCountRow], int, int]:
+    """(hata sayıları, toplam tekrar, hatalı tekrar)."""
+    rows = await conn.fetch(SELECT_ERROR_COUNTS, user_id, start_utc, end_utc, exercise_id)
+    totals = await conn.fetchrow(
+        SELECT_TOTAL_REPS_IN_RANGE, user_id, start_utc, end_utc, exercise_id
     )
     return (
         [ErrorCountRow(error_name=r["error_name"], occurrences=r["occurrences"]) for r in rows],
-        int(total),
+        int(totals["total_reps"]),
+        int(totals["reps_with_errors"]),
     )
 
 

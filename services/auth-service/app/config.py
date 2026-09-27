@@ -16,11 +16,11 @@ class Settings(BaseSettings):
     service_name: str = "auth-service"
     log_level: str = "INFO"
 
-    database_url: str = "postgresql://trainer:trainer@localhost:5433/auth_db"
+    database_url: str = "postgresql://trainer:trainer@localhost:15433/auth_db"
     db_pool_min: int = 2
     db_pool_max: int = 10
 
-    redis_url: str = "redis://localhost:6380/0"
+    redis_url: str = "redis://localhost:16380/0"
 
     # --- JWT ---
     # RS256, HS256 DEĞİL: gateway token'ı yalnızca PUBLIC key ile doğrular,
@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     user_service_url: str = "http://user-service:8000"
     workout_service_url: str = "http://workout-service:8000"
     health_service_url: str = "http://health-service:8000"
+    analytics_service_url: str = "http://analytics-service:8000"
+    social_service_url: str = "http://social-service:8000"
+    chat_service_url: str = "http://chat-service:8000"
     internal_api_key: str = ""
 
     # Worker'ın outbox'ı tarama sıklığı. Kısa tutuluyor: kullanıcı kayıt olduktan
