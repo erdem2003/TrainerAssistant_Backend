@@ -21,6 +21,7 @@ dependencies = [
     # ayristirmasi — FastAPI'nin UploadFile/Form'u calisma zamaninda bunu
     # gerektiriyor (ADR 0016).
     "python-multipart>=0.0.12",
+    "httpx>=0.28",
 ]
 
 [project.optional-dependencies]

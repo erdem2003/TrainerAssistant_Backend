@@ -10,6 +10,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
+from nabiz_firebase.deploy import install_auth, subscribe_http_from_env
+
 from app.config import settings
 from app.correlation import (
     CorrelationMiddleware,
@@ -35,6 +37,8 @@ async def lifespan(_: FastAPI):
     # Kafka relay sürecinin yerini alan süreç içi dağıtıcı (ADR 0019 karar 2).
     # Abonelerini (analytics, social) tek süreçli giriş noktası kaydeder.
     dispatcher = outbox.dispatcher()
+    # ADR 0020: ayrı dağıtımda aboneler (analytics, social) HTTP ile bağlanır.
+    subscribe_http_from_env(settings.internal_api_key)
     if settings.outbox_dispatcher_enabled:
         dispatcher.start()
     logger.info("%s hazır", settings.service_name)
@@ -53,6 +57,8 @@ app = FastAPI(
 )
 
 app.add_middleware(CorrelationMiddleware)
+# ADR 0020: ayrı dağıtımda Firebase token'ını servis kendisi doğrular.
+install_auth(app)
 
 app.add_exception_handler(ApiError, api_error_handler)
 app.add_exception_handler(Exception, unhandled_error_handler)

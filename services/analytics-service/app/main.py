@@ -10,6 +10,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
+from nabiz_firebase.deploy import install_auth
+
 from app.config import settings
 from app.correlation import (
     CorrelationMiddleware,
@@ -51,6 +53,8 @@ app = FastAPI(
 )
 
 app.add_middleware(CorrelationMiddleware)
+# ADR 0020: ayrı dağıtımda Firebase token'ını servis kendisi doğrular.
+install_auth(app)
 
 app.add_exception_handler(ApiError, api_error_handler)
 app.add_exception_handler(Exception, unhandled_error_handler)

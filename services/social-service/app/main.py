@@ -11,6 +11,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
+from nabiz_firebase.deploy import install_auth, standalone
+
 from app.config import settings
 from app.correlation import (
     CorrelationMiddleware,
@@ -35,12 +37,14 @@ async def lifespan(_: FastAPI):
     # Ayrı `social-consumer` Kafka süreci yerine süreç içi dağıtıcıya abonelik
     # + bekleyen gönderi süpürücüsü (ADR 0019 karar 2).
     workout_consumer.register()
-    sweep_task = asyncio.create_task(workout_consumer.sweep_stale_posts_loop())
+    # Ayrı dağıtımda süpürme Cloud Scheduler'dan `/internal/sweep` ile (ADR 0020).
+    sweep_task = None if standalone() else asyncio.create_task(workout_consumer.sweep_stale_posts_loop())
     logger.info("%s hazır", settings.service_name)
     try:
         yield
     finally:
-        sweep_task.cancel()
+        if sweep_task is not None:
+            sweep_task.cancel()
         workout_consumer.unregister()
         await limiter.close()
         await db.close()
@@ -54,6 +58,8 @@ app = FastAPI(
 )
 
 app.add_middleware(CorrelationMiddleware)
+# ADR 0020: ayrı dağıtımda Firebase token'ını servis kendisi doğrular.
+install_auth(app)
 
 app.add_exception_handler(ApiError, api_error_handler)
 app.add_exception_handler(Exception, unhandled_error_handler)
