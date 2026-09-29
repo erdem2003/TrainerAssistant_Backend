@@ -26,6 +26,9 @@ _CATALOG: tuple[Exercise, ...] = (
     Exercise("squat", "Squat", "SIDE"),
     Exercise("bench_press", "Bench Press", "SIDE"),
     Exercise("deadlift", "Deadlift", "SIDE"),
+    # Ekipmansız, rule-based v1 (mobil `lunge.md`, `glute-bridge.md`).
+    Exercise("lunge", "Lunge", "SIDE"),
+    Exercise("glute_bridge", "Glute Bridge", "SIDE"),
 )
 
 _IDS = frozenset(e.id for e in _CATALOG)
