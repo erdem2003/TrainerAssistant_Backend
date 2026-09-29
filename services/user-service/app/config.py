@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     # `DELETE /internal/users/{id}` ucunu koruyan paylaşılan sır.
     internal_api_key: str = ""
 
+    # Davet ödülü: davet edilen ilk antrenmanını bitirince (WorkoutCompleted).
+    topic_workout_session: str = "workout.session"
+    referral_consumer_group: str = "user-referral-v1"
+
 
 @lru_cache
 def get_settings() -> Settings:

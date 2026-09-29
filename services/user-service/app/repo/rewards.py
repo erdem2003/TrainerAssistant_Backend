@@ -90,6 +90,17 @@ async def grant(user_id: uuid.UUID, reward: str, transaction_id: str, now: datet
     return await run(db.client.transaction())
 
 
+def plus_extension(data: dict | None, now: datetime, duration: timedelta) -> datetime:
+    """Mevcut Nabız+ süresinin sonuna `duration` ekler (bitmişse şimdiden başlar)."""
+    current = (data or {}).get("plus_until")
+    base = current if current is not None and current > now else now
+    return base + duration
+
+
+def state_ref(user_id: uuid.UUID):
+    return _state_ref(user_id)
+
+
 async def use_freeze(user_id: uuid.UUID, day: date, now: datetime) -> RewardState | None:
     """`day`'i aktif sayar ve bir hak düşer. Hak yoksa `None`; gün zaten korunmuşsa değişmez."""
     state_ref = _state_ref(user_id)

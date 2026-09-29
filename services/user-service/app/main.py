@@ -20,7 +20,8 @@ from app.correlation import (
 )
 from app.db import db
 from app.errors import ApiError, api_error_handler, unhandled_error_handler
-from app.routers import calibration, health, internal, measurements, profiles, rewards
+from app.routers import calibration, health, internal, measurements, profiles, referrals, rewards
+from app.worker import referral_consumer
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +34,14 @@ async def lifespan(_: FastAPI):
     # başlat" sırasını herkesin hatırlaması gerekirdi; unutulduğunda hata
     # veritabanı seviyesinde ve anlaşılmaz çıkar.
     await db.migrate()
+    # Davet ödülü: ilk antrenman olayını dinler (ADR 0019/0020 — tek süreçte
+    # dağıtıcıya abone; ayrı dağıtımda `/internal/events` ile gelir).
+    referral_consumer.register()
     logger.info("%s hazır", settings.service_name)
     try:
         yield
     finally:
+        referral_consumer.unregister()
         await db.close()
 
 app = FastAPI(
@@ -83,4 +88,5 @@ app.include_router(profiles.router)
 app.include_router(measurements.router)
 app.include_router(calibration.router)
 app.include_router(rewards.router)
+app.include_router(referrals.router)
 app.include_router(internal.router)

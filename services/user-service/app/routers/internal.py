@@ -10,7 +10,8 @@ from fastapi import APIRouter, Header, Response, status
 
 from app.config import settings
 from app.errors import ApiError, forbidden
-from app.repo import processed_events, users
+from app.repo import processed_events, referrals, users
+from app.worker import referral_consumer
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +66,18 @@ async def delete_user_data(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     deleted = await users.delete_all(user_id)
+    await referrals.delete_for(user_id)
     await processed_events.claim(event_id, EVENT_ACCOUNT_DELETED)
 
     logger.info(
         "hesap silme işlendi user_id=%s silinen_doküman=%s", user_id, deleted,
     )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/events", status_code=status.HTTP_204_NO_CONTENT)
+async def receive_event(envelope: dict, x_internal_key: str | None = Header(default=None)) -> Response:
+    """Outbox olayının HTTP ile teslimi (ADR 0020) — davet ödülü tüketicisi."""
+    _require_internal_key(x_internal_key)
+    await referral_consumer.handle(envelope)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
