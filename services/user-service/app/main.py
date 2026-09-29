@@ -20,7 +20,7 @@ from app.correlation import (
 )
 from app.db import db
 from app.errors import ApiError, api_error_handler, unhandled_error_handler
-from app.routers import calibration, health, internal, measurements, profiles
+from app.routers import calibration, health, internal, measurements, profiles, rewards
 
 logger = logging.getLogger(__name__)
 
@@ -82,4 +82,5 @@ app.include_router(health.router)
 app.include_router(profiles.router)
 app.include_router(measurements.router)
 app.include_router(calibration.router)
+app.include_router(rewards.router)
 app.include_router(internal.router)

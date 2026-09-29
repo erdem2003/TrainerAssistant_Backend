@@ -19,6 +19,8 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "httpx>=0.28",
+    # AdMob SSV imza doğrulaması (app/ssv.py); firebase-admin zaten getiriyor.
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
