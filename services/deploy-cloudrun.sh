@@ -24,8 +24,8 @@ gcloud secrets add-iam-policy-binding internal-api-key --project $PROJECT \
   --member="serviceAccount:$PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
   --role=roles/secretmanager.secretAccessor >/dev/null
 
-SUBSCRIBERS=$(printf '{"workout.session":{"analytics-workout-v1":"%s/internal/events","social-workout-v1":"%s/internal/events"}}' \
-  "$(url analytics)" "$(url social)")
+SUBSCRIBERS=$(printf '{"workout.session":{"analytics-workout-v1":"%s/internal/events","social-workout-v1":"%s/internal/events","user-referral-v1":"%s/internal/events"}}' \
+  "$(url analytics)" "$(url social)" "$(url user)")
 
 deploy() {
   local svc=$1; shift
