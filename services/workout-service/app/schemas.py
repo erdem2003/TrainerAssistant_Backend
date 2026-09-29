@@ -161,6 +161,10 @@ class WorkoutOut(BaseModel):
     total_sets: int
     total_reps: int
     sets: list[SetOut]
+    # 0-100 (`app/formscore.py`); eski antrenmanlarda None.
+    form_score: int | None = None
+    # Bu antrenman egzersizin kişisel en iyi form puanını geçti mi (yazım anında).
+    personal_record: bool = False
 
 
 class WorkoutSummary(BaseModel):
@@ -190,6 +194,8 @@ class WorkoutSummary(BaseModel):
     # diye burada: set kırılımı `WorkoutSummary`'de yok ve her antrenmanın
     # ayrıntısını çekmek 200 istek demekti.
     best_set_reps: int
+    # 0-100 form puanı (`app/formscore.py`); alan eklenmeden önceki kayıtlarda None.
+    form_score: int | None = None
 
 
 class WorkoutPage(BaseModel):

@@ -38,6 +38,17 @@ def add_rep_xp_in_tx(tx, user_id: uuid.UUID, amount: int) -> None:
     tx.set(user_doc(user_id), {"rep_xp": firestore.Increment(amount)}, merge=True)
 
 
+async def best_form_in_tx(tx, user_id: uuid.UUID, exercise_id: str) -> int | None:
+    """Egzersizin kişisel en iyi form puanı (`best_form.{exercise}`). Transaction'da
+    YAZIMLARDAN ÖNCE okunmalı (Firestore kuralı)."""
+    snap = await user_doc(user_id).get(transaction=tx)
+    return ((snap.to_dict() or {}).get("best_form") or {}).get(exercise_id) if snap.exists else None
+
+
+def set_best_form_in_tx(tx, user_id: uuid.UUID, exercise_id: str, score: int) -> None:
+    tx.set(user_doc(user_id), {"best_form": {exercise_id: score}}, merge=True)
+
+
 def _claim_ref(user_id: uuid.UUID, day: date, quest_id: str):
     return user_doc(user_id).collection("quest_claims").document(f"{day.isoformat()}_{quest_id}")
 

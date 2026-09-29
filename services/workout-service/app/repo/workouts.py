@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from google.cloud import firestore
 from google.cloud.firestore_v1.field_path import FieldPath
 
+from app import formscore
 from app.db import db, user_doc
 
 # Liste/istatistik/plan sorgularının çektiği alanlar — setler/tekrarlar HARİÇ.
@@ -26,6 +27,7 @@ SUMMARY_FIELDS = [
     "active_seconds",
     "best_set_reps",
     "form_errors",
+    "form_score",
 ]
 
 
@@ -50,6 +52,8 @@ class WorkoutSummaryRow:
     best_set_reps: int
     # hata türü -> kaç tekrarda görüldü
     form_errors: dict[str, int]
+    # 0-100 (`app/formscore.py`); alan eklenmeden önceki antrenmanlarda None.
+    form_score: int | None = None
 
 
 def workouts_col(user_id: uuid.UUID):
@@ -117,6 +121,9 @@ def build_document(
         "active_seconds": sum((s["ended_at"] - s["started_at"]) / 1000.0 for s in set_docs),
         "best_set_reps": max((len(s["reps"]) for s in set_docs), default=0),
         "form_errors": form_errors,
+        "form_score": formscore.workout_score(
+            [(len(r["form_errors"]), r["rom"]) for s in set_docs for r in s["reps"]]
+        ),
         "sets": set_docs,
     }
 
@@ -159,6 +166,7 @@ def _to_summary(snap) -> WorkoutSummaryRow:
         active_seconds=float(data.get("active_seconds", 0.0)),
         best_set_reps=int(data.get("best_set_reps", 0)),
         form_errors=dict(data.get("form_errors") or {}),
+        form_score=data.get("form_score"),
     )
 
 

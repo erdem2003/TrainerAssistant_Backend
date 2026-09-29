@@ -12,7 +12,7 @@ from fastapi import APIRouter, BackgroundTasks, Header, Query, Response, status
 from google.cloud import firestore
 from nabiz_firebase.deploy import standalone
 
-from app import events, quests
+from app import events, formscore, quests
 from app.config import settings
 from app.correlation import current_correlation_id
 from app.db import db
@@ -120,7 +120,19 @@ async def create_workout(
             return existing
         if not exercises.exists(payload.exercise_id):
             raise unprocessable("Bilinmeyen egzersiz", {"exercise_id": payload.exercise_id})
+        # Kişisel form rekoru: okuma yazımlardan önce. Dokümana yazılır ki aynı
+        # id'nin idempotent tekrarı da aynı cevabı versin.
+        best = await progress.best_form_in_tx(tx, user_id, payload.exercise_id)
+        score = document["form_score"]
+        record = (
+            score is not None
+            and document["total_reps"] >= formscore.MIN_REPS_FOR_RECORD
+            and (best is None or score > best)
+        )
+        document["personal_record"] = record
         workouts.insert_in_tx(tx, payload.id, user_id, document)
+        if record:
+            progress.set_best_form_in_tx(tx, user_id, payload.exercise_id, score)
         # XP antrenmanla aynı anda: kayıt varsa XP de var (günlük görev/seviye).
         progress.add_rep_xp_in_tx(tx, user_id, quests.rep_xp(document["total_reps"], document["reps_with_errors"]))
         outbox.enqueue(
@@ -216,6 +228,7 @@ async def list_workouts(
                 reps_with_errors=row.reps_with_errors,
                 total_active_seconds=row.active_seconds,
                 best_set_reps=row.best_set_reps,
+                form_score=row.form_score,
             )
             for row in page
         ],
@@ -273,6 +286,8 @@ def _to_out(workout_id: uuid.UUID, document: dict) -> WorkoutOut:
         total_sets=len(ordered_sets),
         total_reps=sum(s.rep_count for s in ordered_sets),
         sets=ordered_sets,
+        form_score=document.get("form_score"),
+        personal_record=bool(document.get("personal_record", False)),
     )
 
 
