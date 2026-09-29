@@ -22,7 +22,7 @@ from app.correlation import (
 from app.db import db
 from app.ratelimit import limiter
 from app.errors import ApiError, api_error_handler, unhandled_error_handler
-from app.routers import challenges, friendships, health, internal, leaderboards, notifications, posts, profiles
+from app.routers import challenges, friendships, health, internal, leaderboards, league, notifications, posts, profiles
 from app.worker import workout_consumer
 
 logger = logging.getLogger(__name__)
@@ -93,6 +93,7 @@ app.include_router(profiles.router)
 app.include_router(friendships.router)
 app.include_router(posts.router)
 app.include_router(leaderboards.router)
+app.include_router(league.router)
 app.include_router(notifications.router)
 app.include_router(challenges.router)
 app.include_router(internal.router)

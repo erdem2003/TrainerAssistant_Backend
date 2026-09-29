@@ -24,6 +24,7 @@ from app.errors import ApiError, forbidden, unprocessable
 from app.repo import (
     challenges,
     friendships,
+    league,
     posts,
     processed_events,
     profiles,
@@ -85,6 +86,7 @@ async def delete_user_data(
     deleted_posts = await posts.delete_all_for_user(user_id)
     await challenges.delete_for_user(user_id)
     await challenges.delete_kudos_by_giver(user_id)
+    await league.delete_for(user_id)
     # Snapshot'lar + KENDİ gelen kutusu. Bu kullanıcının başkasına AKTÖR olarak
     # bıraktığı bildirimler kalıyor — okuma yolu silinmiş aktörü "Silinmiş
     # kullanıcı" olarak gösteriyor (Postgres dalıyla aynı).

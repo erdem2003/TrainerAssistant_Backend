@@ -27,9 +27,11 @@ from datetime import datetime, timezone
 from google.cloud import firestore
 from nabiz_firebase import outbox as shared_outbox
 
+from app import league
 from app.config import settings
 from app.db import db
-from app.repo import posts, snapshots, tombstones
+from app.repo import league as league_repo
+from app.repo import posts, profiles, snapshots, tombstones
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +96,24 @@ async def handle(envelope: dict) -> bool:
         logger.debug("olay zaten işlenmiş, atlanıyor event_id=%s", event_id)
     elif outcome == "promoted":
         logger.info("gönderi VISIBLE oldu workout_id=%s", workout_id)
+    if outcome in ("written", "promoted") and not replay:
+        await _join_league(user_id, data["started_at"])
     return outcome in ("written", "promoted")
+
+
+async def _join_league(user_id: uuid.UUID, started_at: datetime) -> None:
+    """Haftanın antrenmanı kullanıcıyı lige yerleştirir (ekranı hiç açmasa da
+    grubunda görünür). Yalnız İÇİNDE bulunulan hafta: eski olay geçmiş haftaya
+    üye yazmasın. Hata olayı düşürmez — lig yan etki."""
+    week = league.week_of(started_at)
+    if week != league.week_of(league.utc_now()):
+        return
+    try:
+        profile = await profiles.find_by_user_id(user_id)
+        if profile is not None and profile.social_enabled:
+            await league_repo.ensure_member(user_id, week)
+    except Exception:  # noqa: BLE001 — yan etki; olay işlenmiş sayılır
+        logger.exception("lig üyeliği yazılamadı user_id=%s", user_id)
 
 
 def register() -> None:
