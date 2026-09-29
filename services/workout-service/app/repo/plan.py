@@ -150,3 +150,23 @@ async def replace_day(user_id: uuid.UUID, day: date, items: list) -> None:
             "updated_at": firestore.SERVER_TIMESTAMP,
         }
     )
+
+
+async def set_target_range(user_id: uuid.UUID, exercise_id: str, target: int, first: date, last: date) -> int:
+    """`[first, last]` günlerinde bu egzersizin hedefini değiştirir (uyarlanabilir
+    program önerisi uygulanınca). Egzersizin olmadığı güne kalem EKLEMEZ. Kaç
+    gün değişti döner."""
+    col = _col(user_id)
+    query = (
+        col.where(filter=firestore.FieldFilter(FieldPath.document_id(), ">=", col.document(first.isoformat())))
+        .where(filter=firestore.FieldFilter(FieldPath.document_id(), "<=", col.document(last.isoformat())))
+    )
+    changed = 0
+    async for snap in query.stream():
+        items = snap.get("items") or []
+        if not any(item["exercise_id"] == exercise_id for item in items):
+            continue
+        updated = [{**item, "target_reps": target} if item["exercise_id"] == exercise_id else item for item in items]
+        await snap.reference.update({"items": updated, "updated_at": firestore.SERVER_TIMESTAMP})
+        changed += 1
+    return changed
