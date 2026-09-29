@@ -15,6 +15,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Header, Query, Response, status
+from nabiz_firebase import push_client
 
 from app import social_client
 from app.errors import conflict, not_found, unprocessable
@@ -195,6 +196,7 @@ async def send_message(
             content_hash=incoming_hash,
         )
         if created:
+            await _push_new_message(sender_id, peer_id, cid, body.body)
             return _message_to_out(message)
         existing = message  # eşzamanlı idempotent tekrar yarışı kaybetti
 
@@ -204,6 +206,17 @@ async def send_message(
         raise conflict("Bu mesaj id'si farklı bir içerikle zaten kayıtlı", {"message_id": body.id})
     response.status_code = status.HTTP_200_OK
     return _message_to_out(existing)
+
+
+async def _push_new_message(sender_id: uuid.UUID, peer_id: uuid.UUID, cid: uuid.UUID, text: str) -> None:
+    """Uygulama kapalıyken yeni mesaj bildirimi. `tag` = konuşma: aynı sohbetin
+    bildirimleri üst üste yığılmaz, sonuncusu öncekinin yerini alır."""
+    profile = (await social_client.fetch_profiles([sender_id])).get(str(sender_id))
+    title = profile.display_name if profile else "Yeni mesaj"
+    await push_client.notify(
+        peer_id, title, text, channel="messages",
+        data={"type": "CHAT_MESSAGE", "conversation_id": str(cid), "tag": f"chat-{cid}"},
+    )
 
 
 @router.post("/conversations/{conversation_id}/read", status_code=status.HTTP_204_NO_CONTENT)

@@ -40,9 +40,9 @@ deploy() {
 deploy user
 deploy health
 deploy analytics
-deploy social
+deploy social --set-env-vars "USER_SERVICE_URL=$(url user)"
 deploy workout --set-env-vars "^@^OUTBOX_DISPATCHER_ENABLED=false@OUTBOX_HTTP_SUBSCRIBERS=$SUBSCRIBERS"
-deploy chat --set-env-vars "SOCIAL_SERVICE_URL=$(url social)"
+deploy chat --set-env-vars "SOCIAL_SERVICE_URL=$(url social),USER_SERVICE_URL=$(url user)"
 deploy auth --set-env-vars "USER_SERVICE_URL=$(url user),WORKOUT_SERVICE_URL=$(url workout),HEALTH_SERVICE_URL=$(url health),ANALYTICS_SERVICE_URL=$(url analytics),SOCIAL_SERVICE_URL=$(url social),CHAT_SERVICE_URL=$(url chat)"
 
 # Arka plan döngülerinin yerini alan zamanlayıcılar (ücretsiz: 3 iş).

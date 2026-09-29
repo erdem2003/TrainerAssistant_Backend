@@ -17,13 +17,26 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from google.cloud import firestore
+from nabiz_firebase import push_client
 
 from app.db import db, user_doc
+from app.repo import profiles
 
 _ID_NAMESPACE = uuid.UUID("0b8f1f3e-5a51-4c55-9d4e-1f6f2a9c7e21")
+
+# Aynı bildirim (beğen → kaldır → beğen) bu süre içinde tekrar push ÜRETMEZ.
+PUSH_REPEAT_WINDOW = timedelta(hours=1)
+
+_PUSH_TEXT = {
+    "FRIEND_REQUEST": "sana arkadaşlık isteği gönderdi",
+    "FRIEND_ACCEPTED": "arkadaşlık isteğini kabul etti",
+    "POST_LIKED": "gönderini beğendi",
+    "POST_COMMENTED": "gönderine yorum yaptı",
+    "WORKOUT_KUDOS": "antrenmanını alkışladı",
+}
 
 
 @dataclass(frozen=True)
@@ -65,8 +78,24 @@ async def upsert(
     if tx is not None:
         tx.set(ref, data)
     else:
+        previous = await ref.get()
         await ref.set(data)
+        last = previous.get("created_at") if previous.exists else None
+        if last is None or now - last > PUSH_REPEAT_WINDOW:
+            await _push(recipient_id, notification_type, actor_id, subject_id)
     return UpsertResult(id=notification_id, created_at=now)
+
+
+async def _push(recipient_id: uuid.UUID, notification_type: str, actor_id: uuid.UUID, subject_id: uuid.UUID) -> None:
+    text = _PUSH_TEXT.get(notification_type)
+    if text is None:
+        return
+    actor = await profiles.find_by_user_id(actor_id)
+    name = actor.display_name if actor else "Biri"
+    await push_client.notify(
+        recipient_id, "Nabız", f"{name} {text}", channel="social",
+        data={"type": notification_type, "subject_id": str(subject_id)},
+    )
 
 
 async def fetch_page(recipient_id: uuid.UUID, before: datetime, limit: int) -> list[dict]:

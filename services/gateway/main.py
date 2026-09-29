@@ -44,6 +44,7 @@ sys.path.insert(0, str(ROOT / "shared"))
 # `settings`'leri içe aktarımda okunduğu için YÜKLEMEDEN ÖNCE atanmalı.
 os.environ.setdefault("INTERNAL_API_KEY", secrets.token_urlsafe(32))
 
+from nabiz_firebase import push_client  # noqa: E402
 from nabiz_firebase.auth import FirebaseAuthMiddleware  # noqa: E402
 
 logger = logging.getLogger("gateway")
@@ -130,6 +131,8 @@ def _wire() -> None:
     # chat → social: arkadaşlık kontrolü + profil toplu çekimi.
     social_client = _import_in("chat", _modules["chat"], "app.social_client")
     social_client.use_transport(httpx.ASGITransport(app=apps["social"]), "http://social.internal")
+    # chat/social → user: push bildirimi (`POST /internal/push`).
+    push_client.use_transport(httpx.ASGITransport(app=apps["user"]), "http://user.internal")
     # auth → herkes: hesap silme fan-out'u (`DELETE /internal/users/{id}`).
     fanout = _import_in("auth", _modules["auth"], "app.worker.fanout")
     fanout.use_apps({f"{name}-service": apps[name] for name in SERVICES if name != "auth"})
