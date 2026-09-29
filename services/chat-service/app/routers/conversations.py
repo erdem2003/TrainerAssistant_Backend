@@ -215,7 +215,14 @@ async def _push_new_message(sender_id: uuid.UUID, peer_id: uuid.UUID, cid: uuid.
     title = profile.display_name if profile else "Yeni mesaj"
     await push_client.notify(
         peer_id, title, text, channel="messages",
-        data={"type": "CHAT_MESSAGE", "conversation_id": str(cid), "tag": f"chat-{cid}"},
+        data={
+            "type": "CHAT_MESSAGE",
+            "conversation_id": str(cid),
+            # Alıcının gözünden karşı taraf = gönderen: bildirime basınca sohbet açılır.
+            "peer_user_id": str(sender_id),
+            "peer_name": title,
+            "tag": f"chat-{cid}",
+        },
     )
 
 
