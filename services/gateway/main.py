@@ -63,6 +63,7 @@ ROUTES: dict[str, str] = {
     "/v1/plan": "workout",
     "/v1/stats": "workout",
     "/v1/exercises": "workout",
+    "/v1/quests": "workout",
     "/v1/water": "health",
     "/v1/sleep": "health",
     "/v1/analytics": "analytics",

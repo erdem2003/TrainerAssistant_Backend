@@ -12,13 +12,13 @@ from fastapi import APIRouter, BackgroundTasks, Header, Query, Response, status
 from google.cloud import firestore
 from nabiz_firebase.deploy import standalone
 
-from app import events
+from app import events, quests
 from app.config import settings
 from app.correlation import current_correlation_id
 from app.db import db
 from app.errors import conflict, not_found, unprocessable
 from app.identity import require_user_id
-from app.repo import exercises, outbox, workouts
+from app.repo import exercises, outbox, progress, workouts
 from app.schemas import (
     ExerciseOut,
     RepOut,
@@ -121,6 +121,8 @@ async def create_workout(
         if not exercises.exists(payload.exercise_id):
             raise unprocessable("Bilinmeyen egzersiz", {"exercise_id": payload.exercise_id})
         workouts.insert_in_tx(tx, payload.id, user_id, document)
+        # XP antrenmanla aynı anda: kayıt varsa XP de var (günlük görev/seviye).
+        progress.add_rep_xp_in_tx(tx, user_id, quests.rep_xp(document["total_reps"], document["reps_with_errors"]))
         outbox.enqueue(
             tx,
             event_type=events.EVENT_WORKOUT_COMPLETED,

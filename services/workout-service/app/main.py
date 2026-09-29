@@ -21,7 +21,7 @@ from app.correlation import (
 from app.db import db
 from app.errors import ApiError, api_error_handler, unhandled_error_handler
 from app.repo import outbox
-from app.routers import health, internal, plan, stats, workouts
+from app.routers import health, internal, plan, quests, stats, workouts
 
 logger = logging.getLogger(__name__)
 
@@ -91,4 +91,5 @@ app.include_router(health.router)
 app.include_router(workouts.router)
 app.include_router(plan.router)
 app.include_router(stats.router)
+app.include_router(quests.router)
 app.include_router(internal.router)
