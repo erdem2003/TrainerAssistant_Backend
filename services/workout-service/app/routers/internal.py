@@ -10,7 +10,9 @@ from fastapi import APIRouter, Header, Response, status
 
 from app.config import settings
 from app.errors import ApiError, forbidden
-from app.repo import outbox, processed_events, users
+from pydantic import BaseModel
+
+from app.repo import outbox, processed_events, progress, users
 
 logger = logging.getLogger(__name__)
 
@@ -80,3 +82,22 @@ async def dispatch_outbox(x_internal_key: str | None = Header(default=None)) -> 
     _require_internal_key(x_internal_key)
     sent = await outbox.dispatcher().dispatch_pending()
     return {"dispatched": sent}
+
+
+class RewardIn(BaseModel):
+    user_id: uuid.UUID
+    reward: str
+    transaction_id: str
+
+
+@router.post("/rewards", status_code=status.HTTP_204_NO_CONTENT)
+async def receive_reward(body: RewardIn, x_internal_key: str | None = Header(default=None)) -> Response:
+    """user-service'in ilettiği ödüllü reklam kazanımı (`xp2x`, `quest`). Idempotent."""
+    _require_internal_key(x_internal_key)
+    if body.reward not in ("xp2x", "quest") or not body.transaction_id:
+        raise ApiError(status.HTTP_422_UNPROCESSABLE_ENTITY, "UNPROCESSABLE", "Bilinmeyen ödül")
+    from datetime import datetime, timezone  # noqa: PLC0415 — yalnız bu uçta
+
+    granted = await progress.grant_reward(body.user_id, body.reward, body.transaction_id, datetime.now(timezone.utc))
+    logger.info("ödül işlendi reward=%s yeni=%s user_id=%s", body.reward, granted, body.user_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

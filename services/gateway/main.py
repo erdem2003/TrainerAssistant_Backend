@@ -135,6 +135,9 @@ def _wire() -> None:
     social_client.use_transport(httpx.ASGITransport(app=apps["social"]), "http://social.internal")
     # chat/social → user: push bildirimi (`POST /internal/push`).
     push_client.use_transport(httpx.ASGITransport(app=apps["user"]), "http://user.internal")
+    # user → social/workout: ödüllü reklam kazanımının iletimi (`POST /internal/rewards`).
+    reward_forward = _import_in("user", _modules["user"], "app.reward_forward")
+    reward_forward.use_apps({"social": apps["social"], "workout": apps["workout"]})
     # auth → herkes: hesap silme fan-out'u (`DELETE /internal/users/{id}`).
     fanout = _import_in("auth", _modules["auth"], "app.worker.fanout")
     fanout.use_apps({f"{name}-service": apps[name] for name in SERVICES if name != "auth"})

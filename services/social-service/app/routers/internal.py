@@ -17,6 +17,9 @@ import uuid
 from fastapi import APIRouter, Header, Query, Response, status
 from starlette.concurrency import run_in_threadpool
 
+from pydantic import BaseModel
+
+from app import league as league_rules
 from app import storage
 from app.config import settings
 from app.db import db, user_doc
@@ -179,4 +182,22 @@ async def sweep_stale_posts(x_internal_key: str | None = Header(default=None)) -
     deleted = await posts.sweep_stale_pending()
     if deleted:
         logger.info("bayat PENDING_SNAPSHOT gönderi silindi adet=%d", deleted)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class RewardIn(BaseModel):
+    user_id: uuid.UUID
+    reward: str
+    transaction_id: str
+
+
+@router.post("/rewards", status_code=status.HTTP_204_NO_CONTENT)
+async def receive_reward(body: RewardIn, x_internal_key: str | None = Header(default=None)) -> Response:
+    """user-service'in ilettiği ödüllü reklam kazanımı — `shield`: bu hafta ligden düşme yok."""
+    _require_internal_key(x_internal_key)
+    if body.reward != "shield" or not body.transaction_id:
+        raise unprocessable("Bilinmeyen ödül")
+    week = league_rules.week_of(league_rules.utc_now())
+    granted = await league.grant_shield(body.user_id, body.transaction_id, week)
+    logger.info("lig kalkanı yeni=%s user_id=%s hafta=%s", granted, body.user_id, week)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

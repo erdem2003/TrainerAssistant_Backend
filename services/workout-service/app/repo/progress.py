@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore
@@ -24,10 +24,22 @@ from app.db import db, user_doc
 from app.repo import workouts
 
 
+REWARD_DURATION = timedelta(hours=24)
+
+
 @dataclass(frozen=True)
 class XpState:
     rep_xp: int
     quest_xp: int
+    # Ödüllü reklam (user-service iletir): 24 saat görev XP'si 2 kat / 4. görev.
+    xp2x_until: datetime | None = None
+    extra_quest_until: datetime | None = None
+
+    def xp2x_active(self, now: datetime) -> bool:
+        return self.xp2x_until is not None and self.xp2x_until > now
+
+    def extra_quest_active(self, now: datetime) -> bool:
+        return self.extra_quest_until is not None and self.extra_quest_until > now
 
     @property
     def total(self) -> int:
@@ -69,7 +81,30 @@ async def get_state(user_id: uuid.UUID) -> XpState:
         await _backfill(user_id)
         snap = await user_doc(user_id).get()
         data = snap.to_dict() or {}
-    return XpState(rep_xp=int(data.get("rep_xp", 0)), quest_xp=int(data.get("quest_xp", 0)))
+    return XpState(
+        rep_xp=int(data.get("rep_xp", 0)), quest_xp=int(data.get("quest_xp", 0)),
+        xp2x_until=data.get("xp2x_until"), extra_quest_until=data.get("extra_quest_until"),
+    )
+
+
+async def grant_reward(user_id: uuid.UUID, reward: str, transaction_id: str, now: datetime) -> bool:
+    """`xp2x` / `quest` ödülü: süreyi 24 saat uzatır. `transaction_id` ile idempotent
+    (user-service iletimi yeniden denerse ikinci kez verilmez). `True` = yeni verildi."""
+    field = {"xp2x": "xp2x_until", "quest": "extra_quest_until"}[reward]
+    tx_ref = db.collection("reward_tx").document(transaction_id)
+
+    @firestore.async_transactional
+    async def run(tx) -> bool:
+        if (await tx_ref.get(transaction=tx)).exists:
+            return False
+        snap = await user_doc(user_id).get(transaction=tx)
+        current = (snap.to_dict() or {}).get(field) if snap.exists else None
+        base = current if current is not None and current > now else now
+        tx.set(user_doc(user_id), {field: base + REWARD_DURATION}, merge=True)
+        tx.create(tx_ref, {"user_id": str(user_id), "reward": reward, "created_at": now})
+        return True
+
+    return await run(db.client.transaction())
 
 
 async def claimed_ids(user_id: uuid.UUID, day: date, quest_ids: list[str]) -> set[str]:

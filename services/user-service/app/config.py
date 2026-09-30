@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # `DELETE /internal/users/{id}` ucunu koruyan paylaşılan sır.
     internal_api_key: str = ""
 
+    # Başka serviste etkisi olan ödüllerin (lig kalkanı, 2x XP, ekstra görev)
+    # iletileceği adresler — `app/reward_forward.py`. Boşsa ödül iletilemez.
+    social_service_url: str = ""
+    workout_service_url: str = ""
+
     # Davet ödülü: davet edilen ilk antrenmanını bitirince (WorkoutCompleted).
     topic_workout_session: str = "workout.session"
     referral_consumer_group: str = "user-referral-v1"

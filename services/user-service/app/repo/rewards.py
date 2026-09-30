@@ -23,7 +23,13 @@ MAX_STREAK_FREEZES = 2
 DAILY_REWARD_LIMIT = 10
 REWARD_PLUS = "plus"
 REWARD_FREEZE = "freeze"
-REWARD_TYPES = {REWARD_PLUS, REWARD_FREEZE}
+# Etkisi BAŞKA serviste yaşayan ödüller: user-service yalnız SSV'yi doğrular,
+# günlük sınırı sayar ve ödülü sahibine iletir (`app/reward_forward.py`).
+REWARD_SHIELD = "shield"   # social: bu hafta ligden düşme yok
+REWARD_XP2X = "xp2x"       # workout: 24 saat görev XP'si 2 kat
+REWARD_QUEST = "quest"     # workout: 24 saat için 4. günlük görev
+REMOTE_REWARDS = {REWARD_SHIELD: "social", REWARD_XP2X: "workout", REWARD_QUEST: "workout"}
+REWARD_TYPES = {REWARD_PLUS, REWARD_FREEZE, *REMOTE_REWARDS}
 _FREEZE_DAYS_KEPT = 60
 
 
@@ -81,13 +87,24 @@ async def grant(user_id: uuid.UUID, reward: str, transaction_id: str, now: datet
             current = data.get("plus_until")
             base = current if current is not None and current > now else now
             update["plus_until"] = base + PLUS_DURATION
-        else:
+        elif reward == REWARD_FREEZE:
             update["streak_freezes"] = min(int(data.get("streak_freezes", 0)) + 1, MAX_STREAK_FREEZES)
+        # REMOTE_REWARDS: etki hedef serviste zaten yazıldı; burada yalnız sayaç + işlem kaydı.
         tx.set(state_ref, update, merge=True)
         tx.create(tx_ref, {**record, "status": "granted"})
         return "granted"
 
     return await run(db.client.transaction())
+
+
+async def seen(transaction_id: str) -> bool:
+    return (await _tx_ref(transaction_id).get()).exists
+
+
+async def daily_limit_reached(user_id: uuid.UUID, now: datetime) -> bool:
+    snap = await _state_ref(user_id).get()
+    data = snap.to_dict() if snap.exists else {}
+    return data.get("daily_date") == now.date().isoformat() and int(data.get("daily_count", 0)) >= DAILY_REWARD_LIMIT
 
 
 def plus_extension(data: dict | None, now: datetime, duration: timedelta) -> datetime:

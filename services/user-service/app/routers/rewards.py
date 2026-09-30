@@ -17,7 +17,7 @@ from urllib.parse import parse_qs
 from fastapi import APIRouter, Header, Request, Response, status
 from pydantic import BaseModel
 
-from app import ssv
+from app import reward_forward, ssv
 from app.errors import ApiError, forbidden, unprocessable
 from app.identity import require_user_id
 from app.repo import rewards
@@ -73,7 +73,21 @@ async def admob_ssv(request: Request) -> Response:
         logger.warning("SSV: bilinmeyen ödül=%r tx=%s", reward, transaction_id)
         return Response(status_code=status.HTTP_200_OK)
 
-    result = await rewards.grant(user_id, reward, transaction_id, rewards.utc_now())
+    now = rewards.utc_now()
+    service = rewards.REMOTE_REWARDS.get(reward)
+    if service is not None:
+        if await rewards.seen(transaction_id):
+            return Response(status_code=status.HTTP_200_OK)
+        if await rewards.daily_limit_reached(user_id, now):
+            await rewards.grant(user_id, reward, transaction_id, now)  # "daily_limit" kaydı
+            return Response(status_code=status.HTTP_200_OK)
+        try:
+            await reward_forward.forward(service, user_id, reward, transaction_id)
+        except Exception:  # noqa: BLE001 — AdMob yeniden denesin
+            logger.exception("ödül iletilemedi service=%s tx=%s", service, transaction_id)
+            return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    result = await rewards.grant(user_id, reward, transaction_id, now)
     logger.info("SSV ödül=%s sonuç=%s user_id=%s", reward, result, user_id)
     return Response(status_code=status.HTTP_200_OK)
 

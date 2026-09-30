@@ -32,6 +32,7 @@ class LeagueEntryOut(BaseModel):
 
 class LeagueResultOut(BaseModel):
     week: str
+    shielded: bool = False
     tier_before: str
     tier_after: str
     rank: int
@@ -48,6 +49,8 @@ class LeagueOut(BaseModel):
     demote_count: int
     items: list[LeagueEntryOut]
     last_result: LeagueResultOut | None
+    # Bu hafta düşme kalkanı var mı (ödüllü reklam).
+    shielded: bool = False
 
 
 @router.get("", response_model=LeagueOut)
@@ -88,4 +91,5 @@ async def my_league(x_user_id: str | None = Header(default=None)) -> LeagueOut:
         demote_count=league.DEMOTE_COUNT if size >= league.MIN_GROUP_FOR_DEMOTE else 0,
         items=items,
         last_result=LeagueResultOut(**membership.last_result) if membership.last_result else None,
+        shielded=await league_repo.is_shielded(viewer_id, week),
     )

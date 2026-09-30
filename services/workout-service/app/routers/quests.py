@@ -41,6 +41,9 @@ class QuestOut(BaseModel):
 class QuestDayOut(BaseModel):
     date: str
     quests: list[QuestOut]
+    # Ödüllü reklam etkileri (epoch ms, bitmişse null).
+    xp2x_until: int | None = None
+    extra_quest_until: int | None = None
     xp: int
     level: int
     level_start_xp: int
@@ -62,16 +65,18 @@ async def _day_totals(user_id: uuid.UUID, day: date, offset: int) -> quests.DayT
 
 
 async def _build(user_id: uuid.UUID, day: date, offset: int) -> QuestDayOut:
-    day_quests = quests.quests_for(user_id, day)
+    state = await progress.get_state(user_id)
+    now = datetime.now(timezone.utc)
+    multiplier = 2 if state.xp2x_active(now) else 1
+    day_quests = quests.quests_for(user_id, day, extra=state.extra_quest_active(now))
     totals = await _day_totals(user_id, day, offset)
     claimed = await progress.claimed_ids(user_id, day, [q.id for q in day_quests])
-    state = await progress.get_state(user_id)
     level = quests.level_for(state.total)
     return QuestDayOut(
         date=day.isoformat(),
         quests=[
             QuestOut(
-                id=q.id, kind=q.kind, target=q.target, progress=quests.progress(q, totals), xp=q.xp,
+                id=q.id, kind=q.kind, target=q.target, progress=quests.progress(q, totals), xp=q.xp * multiplier,
                 exercise_id=q.exercise_id, completed=quests.progress(q, totals) >= q.target,
                 claimed=q.id in claimed,
             )
@@ -81,7 +86,13 @@ async def _build(user_id: uuid.UUID, day: date, offset: int) -> QuestDayOut:
         level=level,
         level_start_xp=quests.xp_for_level(level),
         next_level_xp=quests.xp_for_level(level + 1),
+        xp2x_until=_ms(state.xp2x_until) if state.xp2x_active(now) else None,
+        extra_quest_until=_ms(state.extra_quest_until) if state.extra_quest_active(now) else None,
     )
+
+
+def _ms(moment: datetime | None) -> int | None:
+    return int(moment.timestamp() * 1000) if moment else None
 
 
 def _local_today(offset: int) -> date:
@@ -107,12 +118,15 @@ async def claim_quest(body: ClaimIn, x_user_id: str | None = Header(default=None
     if not (today - timedelta(days=_CLAIM_WINDOW_DAYS) <= day <= today):
         raise unprocessable("Bu günün görev ödülü toplanamaz", {"date": body.date})
 
-    quest = next((q for q in quests.quests_for(user_id, day) if q.id == body.quest_id), None)
+    state = await progress.get_state(user_id)
+    now = datetime.now(timezone.utc)
+    quest = next((q for q in quests.quests_for(user_id, day, extra=state.extra_quest_active(now))
+                  if q.id == body.quest_id), None)
     if quest is None:
         raise not_found("Görev bulunamadı")
     totals = await _day_totals(user_id, day, offset)
     if quests.progress(quest, totals) < quest.target:
         raise unprocessable("Görev henüz tamamlanmadı", {"quest_id": quest.id})
-    # Zaten toplanmışsa sessizce aynı durum döner (idempotent).
-    await progress.claim(user_id, day, quest.id, quest.xp)
+    # Zaten toplanmışsa sessizce aynı durum döner (idempotent). 2x XP toplama anında.
+    await progress.claim(user_id, day, quest.id, quest.xp * (2 if state.xp2x_active(now) else 1))
     return await _build(user_id, day, offset)

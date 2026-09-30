@@ -37,7 +37,7 @@ deploy() {
     --quiet "$@"
 }
 
-deploy user
+deploy user --set-env-vars "SOCIAL_SERVICE_URL=$(url social),WORKOUT_SERVICE_URL=$(url workout)"
 deploy health
 deploy analytics
 deploy social --set-env-vars "USER_SERVICE_URL=$(url user)"

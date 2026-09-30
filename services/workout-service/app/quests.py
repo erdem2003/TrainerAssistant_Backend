@@ -66,10 +66,12 @@ def rep_xp(total_reps: int, reps_with_errors: int) -> int:
     return total_reps + max(0, total_reps - reps_with_errors)
 
 
-def quests_for(user_id: uuid.UUID, day: date) -> list[Quest]:
+def quests_for(user_id: uuid.UUID, day: date, extra: bool = False) -> list[Quest]:
+    """`extra` (ödüllü reklam): 4. görev. İlk üç görev `extra`dan BAĞIMSIZ aynı —
+    türler tam permütasyondan sırayla alınıyor, hedefler de aynı sırayla çekiliyor."""
     seed = hashlib.sha256(f"{user_id}|{day.isoformat()}".encode()).digest()
     rng = random.Random(seed)
-    kinds = rng.sample(sorted(_POOL), QUESTS_PER_DAY)
+    kinds = rng.sample(sorted(_POOL), len(_POOL))[: QUESTS_PER_DAY + (1 if extra else 0)]
     quests = []
     for kind in kinds:
         target, xp = rng.choice(_POOL[kind])

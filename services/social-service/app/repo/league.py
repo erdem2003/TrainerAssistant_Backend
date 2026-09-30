@@ -79,7 +79,7 @@ async def group_standings(group_id: str) -> tuple[dict, list[Standing]]:
     return group, [Standing(rank=i, breakdown=b) for i, b in enumerate(breakdowns, start=1)]
 
 
-async def _result_of(user_id: uuid.UUID, week: date) -> dict | None:
+async def _result_of(user_id: uuid.UUID, week: date, shielded: bool = False) -> dict | None:
     member = await _member_ref(week, user_id).get()
     if not member.exists:
         return None
@@ -92,7 +92,8 @@ async def _result_of(user_id: uuid.UUID, week: date) -> dict | None:
     return {
         "week": week.isoformat(),
         "tier_before": tier,
-        "tier_after": league.next_tier(tier, mine.rank, len(standings), mine.breakdown.score),
+        "tier_after": _apply_shield(tier, league.next_tier(tier, mine.rank, len(standings), mine.breakdown.score), shielded),
+        "shielded": shielded,
         "rank": mine.rank,
         "group_size": len(standings),
         "score": mine.breakdown.score,
@@ -116,7 +117,8 @@ async def ensure_member(user_id: uuid.UUID, week: date) -> Membership:
     if state and state.get("week"):
         previous_week = date.fromisoformat(state["week"])
         if previous_week == week - timedelta(days=7):
-            last_result = await _result_of(user_id, previous_week)
+            shielded = state.get("shield_week") == previous_week.isoformat()
+            last_result = await _result_of(user_id, previous_week, shielded)
             tier = last_result["tier_after"] if last_result else state.get("tier", tier)
         elif previous_week < week:
             tier = league.after_absence(state.get("tier", tier))
@@ -150,6 +152,33 @@ async def ensure_member(user_id: uuid.UUID, week: date) -> Membership:
 
     group_id = await join(db.client.transaction())
     return Membership(week, tier, group_id, last_result)
+
+
+def _apply_shield(before: str, after: str, shielded: bool) -> str:
+    """Kalkan (ödüllü reklam): o hafta düşme yok — terfi etkilenmez."""
+    if shielded and league.tier_index(after) < league.tier_index(before):
+        return before
+    return after
+
+
+async def is_shielded(user_id: uuid.UUID, week: date) -> bool:
+    snap = await _state_ref(user_id).get()
+    return snap.exists and (snap.to_dict() or {}).get("shield_week") == week.isoformat()
+
+
+async def grant_shield(user_id: uuid.UUID, transaction_id: str, week: date) -> bool:
+    """Bu hafta için düşme kalkanı. `transaction_id` ile idempotent. `True` = yeni verildi."""
+    tx_ref = db.collection("reward_tx").document(transaction_id)
+
+    @firestore.async_transactional
+    async def run(tx) -> bool:
+        if (await tx_ref.get(transaction=tx)).exists:
+            return False
+        tx.set(_state_ref(user_id), {"shield_week": week.isoformat()}, merge=True)
+        tx.create(tx_ref, {"user_id": str(user_id), "reward": "shield", "week": week.isoformat()})
+        return True
+
+    return await run(db.client.transaction())
 
 
 async def delete_for(user_id: uuid.UUID) -> None:
